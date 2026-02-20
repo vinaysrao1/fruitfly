@@ -1,0 +1,24 @@
+# Databases
+*.duckdb
+*.duckdb.wal
+
+# Binaries
+/fruitfly
+jetstream_test/bin/
+jetstream_test/shim/jetstream_shim
+jetstream_test/receiver/jetstream_receiver
+jetstream_test/validate/jetstream_validate
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+
+# Test artifacts
+/tmp/jetstream_shim_stats.txt
+
+# Go
+*.exe
+*.test
+*.out

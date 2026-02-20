@@ -1,0 +1,6 @@
+address: ":8080"
+rules_dir: "./jetstream_test/rules"
+duckdb_path: "./jetstream_test.duckdb"
+webhook_url: "http://localhost:9090/webhook"
+workers: 4
+log_level: info
