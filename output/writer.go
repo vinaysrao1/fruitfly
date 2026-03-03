@@ -217,7 +217,7 @@ func (w *Writer) insertBatch(batch []types.Result) error {
 
 func (w *Writer) runRetention() {
 	_, err := w.db.Exec(
-		fmt.Sprintf(`DELETE FROM results WHERE processed_at < now() - interval '%d days'`, retainDays),
+		fmt.Sprintf(`DELETE FROM results WHERE processed_at < now()::TIMESTAMP - interval '%d days'`, retainDays),
 	)
 	if err != nil {
 		slog.Error("retention: delete failed", "error", err)
