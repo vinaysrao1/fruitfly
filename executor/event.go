@@ -8,12 +8,15 @@ import (
 )
 
 // eventToStarlark converts a types.Event to a Starlark dict.
+// The dict is frozen: it is shared by every rule evaluated for the event,
+// and an unfrozen dict would let one rule mutate what later rules see.
 func eventToStarlark(event types.Event) *starlark.Dict {
 	d := starlark.NewDict(4)
 	d.SetKey(starlark.String("event_id"), starlark.String(event.EventID))
 	d.SetKey(starlark.String("event_type"), starlark.String(event.EventType))
 	d.SetKey(starlark.String("timestamp"), starlark.MakeInt64(event.Timestamp.Unix()))
 	d.SetKey(starlark.String("payload"), anyToStarlark(event.Payload))
+	d.Freeze()
 	return d
 }
 

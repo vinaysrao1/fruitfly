@@ -89,6 +89,10 @@ type testPipeline struct {
 	dbPath     string
 	webhookSrv *httptest.Server
 	webhookCh  chan []byte // receives raw webhook POST bodies
+
+	// pipeCancel force-cancels in-flight evaluation/output; used only as a
+	// backstop, mirroring main.go.
+	pipeCancel context.CancelFunc
 }
 
 // newTestPipeline creates a fully wired pipeline for integration testing.
@@ -167,33 +171,40 @@ func newTestPipeline(t *testing.T, ruleSource string, opts testPipelineOpts, web
 	}
 }
 
-// start launches pipeline goroutines. Returns cancel func and done channels.
+// start launches pipeline goroutines, mirroring main.go's two lifecycles:
+// the returned cancel stops the reloader; pool and writer run under a
+// separate pipeline context that stays live through the shutdown drain.
 func (tp *testPipeline) start(t *testing.T) (cancel context.CancelFunc, poolDone <-chan struct{}, writerDone <-chan error) {
 	t.Helper()
 
-	ctx, cancelFn := context.WithCancel(context.Background())
+	reloadCtx, reloadCancel := context.WithCancel(context.Background())
+	pipeCtx, pipeCancel := context.WithCancel(context.Background())
+	tp.pipeCancel = pipeCancel
+	t.Cleanup(pipeCancel)
 
 	poolDoneCh := make(chan struct{})
 	go func() {
 		defer close(poolDoneCh)
-		tp.pool.Run(ctx, tp.eventChan, tp.resultChan)
+		tp.pool.Run(pipeCtx, tp.eventChan, tp.resultChan)
 	}()
 
 	writerDoneCh := make(chan error, 1)
 	go func() {
-		writerDoneCh <- tp.writer.Run(ctx, tp.resultChan)
+		writerDoneCh <- tp.writer.Run(pipeCtx, tp.resultChan)
 	}()
 
-	go tp.reloader.Run(ctx)
+	go tp.reloader.Run(reloadCtx)
 
-	return cancelFn, poolDoneCh, writerDoneCh
+	return reloadCancel, poolDoneCh, writerDoneCh
 }
 
 // shutdown executes the graceful shutdown sequence and waits for completion.
+// Mirrors main.go: stop the reloader, then close eventChan as the drain
+// signal. The pipeline context stays live so drained events evaluate under
+// their normal timeouts; it is force-cancelled only if the pool wedges.
 func (tp *testPipeline) shutdown(t *testing.T, cancel context.CancelFunc, poolDone <-chan struct{}, writerDone <-chan error) {
 	t.Helper()
 
-	// Cancel context and close eventChan to signal workers to drain.
 	cancel()
 	close(tp.eventChan)
 
@@ -201,6 +212,7 @@ func (tp *testPipeline) shutdown(t *testing.T, cancel context.CancelFunc, poolDo
 	select {
 	case <-poolDone:
 	case <-time.After(10 * time.Second):
+		tp.pipeCancel()
 		t.Fatal("pool did not finish within 10 seconds")
 	}
 
@@ -208,6 +220,7 @@ func (tp *testPipeline) shutdown(t *testing.T, cancel context.CancelFunc, poolDo
 	select {
 	case <-writerDone:
 	case <-time.After(10 * time.Second):
+		tp.pipeCancel()
 		t.Fatal("writer did not finish within 10 seconds")
 	}
 }
@@ -371,4 +384,3 @@ func (tp *testPipeline) queryDBLatencyPercentiles(t *testing.T) (p50us, p99us in
 	}
 	return int64(p50f), int64(p99f)
 }
-

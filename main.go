@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -155,25 +156,31 @@ func main() {
 		w.Write([]byte("# metrics placeholder\n"))
 	})
 
-	// Main context for graceful shutdown.
-	ctx, cancel := context.WithCancel(context.Background())
+	// Two separate lifecycles. reloadCtx stops background services. pipeCtx
+	// governs in-flight evaluation and output; it stays live through the
+	// shutdown drain and is cancelled only as a last-resort backstop, so
+	// queued events are never evaluated under a cancelled context (which
+	// would fail every rule and fall open to approve).
+	reloadCtx, reloadCancel := context.WithCancel(context.Background())
+	pipeCtx, pipeCancel := context.WithCancel(context.Background())
+	defer pipeCancel()
 
 	// Start background goroutines.
 	go func() {
-		if err := reloader.Run(ctx); err != nil {
+		if err := reloader.Run(reloadCtx); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Error("reloader exited with error", "error", err)
 		}
 	}()
 
 	writerDone := make(chan error, 1)
 	go func() {
-		writerDone <- writer.Run(ctx, resultChan)
+		writerDone <- writer.Run(pipeCtx, resultChan)
 	}()
 
 	poolDone := make(chan struct{})
 	go func() {
 		defer close(poolDone)
-		pool.Run(ctx, eventChan, resultChan)
+		pool.Run(pipeCtx, eventChan, resultChan)
 	}()
 
 	// Start HTTP server.
@@ -201,33 +208,48 @@ func main() {
 		slog.Error("HTTP server error", "error", err)
 	}
 
-	// 5-step graceful shutdown sequence.
+	// Graceful shutdown sequence. Invariant: a queued event is either
+	// evaluated under a healthy context (normal per-event timeouts apply)
+	// or not at all — never under a cancelled one.
 
-	// Step 1: Stop accepting new HTTP requests.
+	// Step 1: Stop accepting new HTTP requests. After this no handler can
+	// send to eventChan, so closing it below is safe.
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer shutCancel()
 	if err := srv.Shutdown(shutCtx); err != nil {
 		slog.Error("HTTP server shutdown error", "error", err)
 	}
 
-	// Step 2: Cancel context (stops reloader) and close eventChan (signals workers to drain).
-	cancel()
+	// Step 2: Stop the reloader; it cannot affect in-flight verdicts.
+	reloadCancel()
+
+	// Step 3: Close eventChan — the drain signal. Workers finish queued
+	// events under the still-live pipeline context.
 	close(eventChan)
 
-	// Step 3: Wait for pool to finish processing all in-flight events (it closes resultChan).
+	// Step 4: Wait for the pool (it closes resultChan when done). If it
+	// exceeds the shutdown budget, force-cancel evaluation as a last
+	// resort: remaining rules abort with errors rather than hanging the
+	// process.
 	select {
 	case <-poolDone:
 	case <-shutCtx.Done():
-		slog.Warn("pool did not finish within shutdown timeout")
+		slog.Warn("pool did not drain within shutdown timeout, force-cancelling evaluation")
+		pipeCancel()
+		select {
+		case <-poolDone:
+		case <-time.After(2 * time.Second):
+			slog.Warn("pool still running after force-cancel")
+		}
 	}
 
-	// Step 4: Wait for writer to flush and close DuckDB.
+	// Step 5: Wait for the writer to flush and close DuckDB. Fresh budget:
+	// the writer only makes progress once resultChan is closed.
 	select {
 	case <-writerDone:
-	case <-shutCtx.Done():
+	case <-time.After(shutdownTimeout):
 		slog.Warn("writer did not finish within shutdown timeout")
 	}
 
-	// Step 5: Log completion.
 	slog.Info("shutdown complete")
 }

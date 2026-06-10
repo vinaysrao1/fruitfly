@@ -366,6 +366,73 @@ def evaluate(event):
 	}
 }
 
+// TestEventFrozen_RuleCannotMutateSharedEvent is the regression test for the
+// unfrozen-event bug: the Starlark event dict is shared by every rule
+// evaluated for an event, so without freezing, a higher-priority rule could
+// mutate the payload and silently change what lower-priority rules see
+// (proven to flip a block verdict to approve). The mutating rule must fail
+// and the original payload must reach later rules intact.
+func TestEventFrozen_RuleCannotMutateSharedEvent(t *testing.T) {
+	snap := compileRules(t, []struct{ filename, source string }{
+		{"mutator.star", `
+rule_id = "mutator"
+event_type = "purchase"
+priority = 200
+def evaluate(event):
+    event["payload"]["amount"] = 0
+    return verdict("approve")
+`},
+		{"blocker.star", `
+rule_id = "blocker"
+event_type = "purchase"
+priority = 100
+def evaluate(event):
+    if event["payload"]["amount"] > 100:
+        return verdict("block", reason="amount too high")
+    return verdict("approve")
+`},
+	})
+	pool, _ := makePool(snap, 1)
+	result := runSingleEvent(t, pool, testEvent("purchase", map[string]any{"amount": float64(9999)}))
+
+	if len(result.FailedRules) != 1 {
+		t.Fatalf("FailedRules len = %d, want 1 (mutator must fail on frozen event)", len(result.FailedRules))
+	}
+	if result.FailedRules[0].RuleID != "mutator" {
+		t.Errorf("failed rule = %q, want mutator", result.FailedRules[0].RuleID)
+	}
+	if !strings.Contains(result.FailedRules[0].Err.Error(), "frozen") {
+		t.Errorf("mutator error = %v, want mention of frozen value", result.FailedRules[0].Err)
+	}
+	if result.FinalVerdict != types.VerdictBlock {
+		t.Errorf("FinalVerdict = %q, want block (event mutation must not leak across rules)", result.FinalVerdict)
+	}
+}
+
+// TestMemoFrozen_ValueCannotBeMutated: memoized values are shared by every
+// rule evaluated for an event, so they are frozen before caching; mutation
+// must be a rule error rather than cross-rule state leakage.
+func TestMemoFrozen_ValueCannotBeMutated(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "memo-mutator"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    val = memo("k", lambda: [1, 2])
+    val.append(3)
+    return verdict("approve")
+`)
+	pool, _ := makePool(snap, 1)
+	result := runSingleEvent(t, pool, testEvent("post", nil))
+
+	if len(result.FailedRules) != 1 {
+		t.Fatalf("FailedRules len = %d, want 1 (append to frozen memo value must fail)", len(result.FailedRules))
+	}
+	if !strings.Contains(result.FailedRules[0].Err.Error(), "frozen") {
+		t.Errorf("error = %v, want mention of frozen value", result.FailedRules[0].Err)
+	}
+}
+
 // --- T9b: Rule returns None -> FailedRules ---
 
 // T9b: evaluate() returns None -> interpretVerdict fails -> rule in FailedRules.

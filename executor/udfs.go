@@ -58,6 +58,9 @@ func memoUDF(w *worker) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple
 		if err != nil {
 			return nil, fmt.Errorf("memo(%q): %w", key, err)
 		}
+		// Freeze before caching: the value is shared by every rule
+		// evaluated for this event.
+		result.Freeze()
 		w.memo[key] = result
 		return result, nil
 	}
