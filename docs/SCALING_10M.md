@@ -1,6 +1,8 @@
 # Scaling Fruitfly to 10M events/sec
 
-**Status**: Design proposal
+**Status**: Design proposal — rev 2, incorporating external code-review
+findings (counter-key affinity, batch-vs-affinity routing, shed policy,
+frozen globals, sizing arithmetic)
 **Baseline**: measured on commit `36d6e04` (see `executor/bench_test.go`, `output/bench_test.go`)
 
 This document describes how fruitfly evolves from a single-binary rules engine
@@ -15,11 +17,12 @@ single, dependency-free binary that is trivial to run on one CPU.
 1. **One binary, every scale.** `./fruitfly` on a laptop and a 64-core
    Kubernetes pod run the same code path. There is no "distributed mode"
    codebase; a cluster is N identical processes plus a routing rule.
-2. **Entity affinity is the only coordination primitive.** All shared state
-   (counters) is keyed by entity ID. If `hash(entity_id)` deterministically
-   picks the worker within a process and the pod within a cluster, counters
-   never need locks, atomics across owners, or external storage. Scaling is
-   sharding, nothing else.
+2. **Key affinity is the only coordination primitive.** All shared state
+   (counters) is keyed. Within a process, counter storage shards by counter
+   key; across pods, events route by a declared routing key. Exact counters
+   are guaranteed exactly where key and routing affinity coincide — a
+   constraint the design states up front (§4, §6) instead of discovering in
+   production. Scaling is sharding, nothing else.
 3. **Pay per byte touched, not per byte received.** Events are kept as raw
    bytes; parsing happens lazily, only for fields a rule actually reads.
 4. **Rules declare their cheap part.** Every rule can be split into a native
@@ -40,10 +43,14 @@ single, dependency-free binary that is trivial to run on one CPU.
 | Counters | ~450ns/call, 0 alloc | ~100ns | single-owner shards (no sync.Map) |
 | Result + output | ~µs + slices per event | ~100ns amortized | pooled results, interesting-only emission |
 
-Net: **~37µs/event/core today → 3–6µs/event/core**, i.e. 150–300k events/sec
-per core. 10M events/sec lands at **40–70 cores** (one or two large pods, or
-a handful of small ones) when rules are well-partitioned, degrading
-gracefully (more cores) when many rules pass tier 1.
+Net: **~37µs/event/core today → 3–6µs/event/core**, i.e. 167–333k
+events/sec per core. 10M events/sec is then **30–60 cores of evaluation;
+provision 50–70 for headroom** (one or two large pods, or a handful of small
+ones) when rules are well-partitioned, degrading gracefully (more cores)
+when many rules pass tier 1. The 200ns decode target assumes SIMD-grade
+field scanning; a portable hand-rolled scanner at ~500ns still fits the
+budget. Batch transport (§2) amortizes HTTP/syscall cost to noise per event;
+it is not free and is why batching is the flagship endpoint.
 
 ---
 
@@ -87,6 +94,13 @@ A streaming scanner (hand-rolled or `simdjson`-style) extracts only the three
 envelope fields; everything else stays bytes. The full parse happens lazily
 inside the executor, and only if a tier-2 rule runs (§4).
 
+Events without the declared entity field must not collapse onto one shard
+(`hash("")` is a guaranteed hot spot at 10M/s): routing falls back to
+`hash(event_id)` — server-generated UUIDv7 when the client omits it — which
+spreads them uniformly. Such events evaluate normally; they simply have no
+routing affinity, so the counter-affinity rule in §6 treats any `counter()`
+key they use as non-affine.
+
 **Dispatch: entity-sharded SPSC rings.** The shared channel is replaced by
 one single-producer/single-consumer ring buffer per worker. The ingest
 goroutine routes each event with `shard = hash(EntityID) % workers`. Two
@@ -99,9 +113,12 @@ consequences:
 
 **Backpressure: explicit shed policy, not per-event 429s.** Rings report
 fill level; when a ring is over the high-water mark the ingest layer applies
-a configured policy: `reject` (429 the whole batch), `drop-oldest`, or
-`degrade` (skip tier-2, verdict from tier-1 only, marked in the result).
-Single-CPU default stays `reject` — today's behavior.
+a configured policy: `reject` (429 the whole batch) or `drop-oldest` (shed
+the queue head; every shed event increments an exposed metric). A third
+policy — "degrade to tier-1-only evaluation" — was considered and rejected:
+tier-1 prefilters (§3) are boolean gates, not verdicts, so a degraded
+verdict has no sound definition for a block/approve engine. Single-CPU
+default stays `reject` — today's behavior.
 
 ---
 
@@ -144,6 +161,20 @@ Starlark and no allocation. Supported ops stay deliberately tiny: `==`, `!=`,
 `<`, `<=`, `>`, `>=`, `in`, `exists`, `prefix`. Anything fancier belongs in
 `evaluate()`.
 
+The lowering semantics are fixed, not implementation-defined:
+
+- `match` must be a static dict literal; computing it dynamically is a
+  compile error.
+- A missing or type-mismatched field makes that clause **false** — the rule
+  is skipped, never errored. (`exists` is the explicit way to test
+  presence.)
+- All JSON numbers compare as float64; integer constants in clauses are
+  widened. `in` lists must be homogeneous scalars, checked at compile time.
+  `prefix` on a non-string field is false.
+- Observability: a prefiltered rule never appears in triggered/failed
+  accounting, so each rule exposes a `prefiltered` counter — an
+  over-aggressive `match` must be visible, not silent.
+
 This is the single most important lever for 10k rules: the per-event cost
 becomes `(matched rules × 10ns) + (surviving rules × ~1.5µs)`, and rule
 authors control the surviving set.
@@ -153,9 +184,20 @@ authors control the surviving set.
 - `CompileDir` compiles files across `GOMAXPROCS` goroutines (compilation is
   pure). 10k rules compile in roughly the time 10k/N took before.
 - The snapshot pre-runs `Program.Init` once per rule at compile time and
-  stores the extracted `evaluate` callables, so a snapshot swap costs workers
-  nothing — today each worker re-inits each rule on first use after a swap,
-  which at 10k rules × 64 workers is a visible warmup spike.
+  stores the extracted `evaluate` callables **with their globals frozen** —
+  starlark-go freezes only via `ExecFile`, not `Program.Init`, so the
+  snapshot must call `Freeze()` explicitly. Freezing is what makes one
+  shared snapshot safe across 64 workers, and it deliberately tightens the
+  contract: mutating module-level state becomes a runtime error instead of
+  today's silent per-worker mutable globals (whose value depends on which
+  worker an event happens to land on — nondeterminism not worth
+  preserving). With that, a snapshot swap costs workers nothing; today each
+  worker re-inits every rule on first use after a swap, a visible warmup
+  spike at 10k rules × 64 workers.
+- The reloader stops recompiling on a timer: poll ticks hash the rules
+  directory contents and skip publication when nothing changed, so snapshot
+  IDs change only when rules do. (Today every 10-second poll mints a new
+  snapshot ID and silently invalidates every worker's eval cache.)
 - The index extends to two levels: `event_type → []ruleRef` exactly as now,
   with each `ruleRef` carrying its tier-1 predicate inline so matching and
   prefiltering are one cache-friendly scan over a flat slice.
@@ -177,18 +219,30 @@ per event; counters in per-worker `sync.Map` with cross-worker reads
 
 ### Design
 
-**Workers own entity shards.** Because ingest routes by `hash(EntityID)`
-(§2), each worker is the *only* goroutine that ever touches its counters.
-The `sync.Map` + atomics design — which exists solely because any worker
-could read any other's counters — collapses into a plain
-`map[counterKey]*counterSeries` with zero synchronization. `counter()`
-becomes a map lookup plus 60 int reads, ~100ns, and the code gets *simpler*
-than what we have today. The ring-buffer bucket design from `36d6e04` is
-kept unchanged; only the container changes.
+**Counters shard by counter key, not by who's asking.** An earlier revision
+of this document claimed entity routing lets each worker keep counters in a
+plain private map with zero synchronization. That is wrong for the actual
+API: `counter(entity_id, …)` takes an *arbitrary* key — a rule processing a
+sender-routed event may legitimately count by recipient, by IP, or by a
+global literal (the docs showcase exactly this) — so increments cannot be
+assumed local to the processing worker, and per-worker private maps would
+silently undercount. The corrected design:
 
-(`CounterSum` as a cross-worker API disappears; a `counter()` call can only
-be answered by the owning worker, and the owning worker is, by construction,
-the one asking.)
+- Counter storage is a fixed array of shards (e.g. 256), selected by
+  `hash(counter key)`. There is **one home shard per key**, not one copy
+  per worker.
+- The per-slot `bucket`/`count` atomics from `36d6e04` carry all read/write
+  traffic, exactly as today; the shard map itself synchronizes only on
+  series creation/GC.
+- Any worker may increment any key; a `counter()` read touches exactly one
+  shard — one map lookup plus 60 atomic reads, ~100–450ns measured.
+  `CounterSum`'s scan-every-worker shape disappears, but because keys have
+  a single home shard, not because reads are worker-local.
+
+Within a single process, arbitrary counter keys therefore stay **exact** —
+identical semantics to today. What event routing buys is cache locality in
+the common case (most rules count by the event's own entity) and the
+cross-pod story in §6, which is where keys genuinely become constrained.
 
 **The lazy Starlark view replaces eventToStarlark.** A `*LazyEvent`
 implements `starlark.Mapping` over `RawEvent.Bytes`. `event["payload"]`
@@ -270,23 +324,54 @@ the sink boundary; the engine core no longer knows DuckDB exists.
 
 ## 6. Horizontal scaling (Kubernetes)
 
-The cluster is the same binary repeated, with entity affinity preserved one
-level up: **`hash(entity_id)` chooses the pod exactly the way it chooses the
-worker inside a pod.** No coordinator, no shared database, no gossip. Two
-deployment shapes, both using a plain `Deployment` + headless `Service`:
+The cluster is the same binary repeated, with key affinity preserved one
+level up: **the routing key chooses the pod exactly the way it chooses the
+worker inside a pod.** No coordinator, no shared database, no gossip. The
+routing key is explicit configuration: each event type declares its routing
+field (default `payload.entity_id`, falling back to `event_id` when absent —
+§2), and that one declaration drives in-process dispatch, pod selection, and
+the counter-affinity rule below.
 
-**Shape A — affinity at the edge (preferred).** The load balancer in front
-(Envoy/Istio `RING_HASH` on an `X-Entity-Id` header, or NGINX
+Two deployment shapes, both using a plain `Deployment` + headless `Service`:
+
+**Shape A — affinity at the edge.** The load balancer in front (Envoy/Istio
+`RING_HASH` on an `X-Entity-Id` header, or NGINX
 `hash $http_x_entity_id consistent`) routes by entity. Fruitfly pods are
 rule-evaluation workers and nothing else. Producers (or a thin gateway) set
-the header from the payload.
+the header from the payload. The honest caveat: **batches and Shape A only
+compose if the producer partitions each batch by the ring** — one request
+per target shard — since a mixed-entity batch has no single routing header.
+That is real producer-side coupling; producers that can't pre-partition
+should use Shape B.
 
 **Shape B — self-routing (zero infra dependencies).** Any fruitfly pod
-accepts any event; if `hash(entity_id)` maps to a peer (discovered via the
-headless service DNS, consistent-hash ring over ready endpoints), it
-forwards the *raw bytes* over a pooled connection. Costs one extra network
+accepts any event or batch; it splits batches by the ring (discovered via
+the headless service DNS, consistent-hash over ready endpoints) and forwards
+*raw bytes* to owning peers over pooled connections. Costs one extra network
 hop for (N-1)/N of traffic; buys a cluster with literally nothing but
-Kubernetes. This is the `fruitfly`-only story for OSS users.
+Kubernetes. Forwarded events carry a forwarded marker and are processed
+wherever they land — **never re-forwarded**. During ring divergence
+(rollouts, scale events, DNS propagation) pods briefly disagree about
+ownership; the marker bounds every event to at most one hop and makes
+routing loops impossible, at the cost that a misrouted event's counter
+increments land on the temporarily-wrong home — the same class of
+approximation as rebalance below.
+
+**Counter keys in a cluster.** Exactness requires affinity. A `counter()`
+key derived from the event's routing key (the key itself, or a declared
+derivation such as a prefixed scope of it) is exact: every increment and
+read for that key happens on its home pod. Any other key — recipient on a
+sender-routed event, an IP, a global literal — would scatter increments
+across pods' private shards and silently undercount, which is the one
+failure mode a rate-limiting primitive must never have. Cluster mode
+therefore **rejects non-affine counter keys at evaluation** (the rule lands
+in `FailedRules` with a clear error; statically derivable keys are linted at
+compile time). The supported pattern for multi-perspective counting is
+producer-side fan-out: emit a second event routed by the other perspective —
+e.g. a `message-received` event routed by recipient alongside the
+`message-sent` event routed by sender — and each perspective gets exact
+counters with zero coordination. Single-process deployments are unaffected:
+with one node, every key is affine, and today's semantics hold unchanged.
 
 **Counters during rebalance.** Counters are sliding-window approximations by
 design. When the ring changes (scale-out, pod restart), ~1/N of entities
@@ -301,10 +386,12 @@ reloader works unchanged) or via `POST /admin/rules/reload` per pod after a
 rollout. Snapshot IDs are exposed at `/admin/rules`, so a simple check
 confirms the fleet converged.
 
-**Sizing at the target.** 10M events/sec ÷ ~200k events/sec/core ≈ 50–70
-cores → e.g. 2× 32-core pods with headroom, or 9× 8-core pods. HPA on CPU
-works because the workload is CPU-bound and shard movement is cheap by
-design.
+**Sizing at the target.** At 167–333k events/sec/core (§1), 10M events/sec
+is 30–60 cores of evaluation; provision 50–70 for headroom → e.g. 2×
+32-core pods, or 9× 8-core pods. HPA on CPU works because the workload is
+CPU-bound and shard movement is cheap by design — but pair it with a
+stabilization window (~5 minutes) so ring churn, and the 1/N counter resets
+each change causes, tracks sustained load rather than noise.
 
 ---
 
@@ -314,8 +401,10 @@ design.
   the right one).
 - The counter ring-buffer bucket layout (`36d6e04`).
 - The per-event-type rule index.
-- Starlark as the rule language, `verdict()`/`memo()`/`counter()` API,
-  priority-then-weight resolution.
+- Starlark as the rule language, `verdict()`/`memo()`, priority-then-weight
+  resolution. `counter()` keeps its signature; single-process semantics are
+  unchanged, with one new cluster-mode constraint — keys must be affine to
+  the event's routing key (§6).
 - The admin surface (`/admin/health`, `/admin/ready`, `/admin/rules`).
 - Single-binary, CGO-free-by-default builds (DuckDB moves behind a tag).
 
@@ -324,17 +413,24 @@ design.
 Each phase is independently shippable and benchmarked against
 `executor/bench_test.go` before/after:
 
-1. **Output decoupling** — `Sink` interface, emission policy, batched
-   webhook, DuckDB behind a build tag. (Removes the first wall; no hot-path
-   changes.)
-2. **Entity-sharded workers** — hash dispatch, SPSC rings, plain-map
-   counters, watchdog + step-limit timeouts, pooled results. (Hot path goes
-   lock-free and timer-free; the code gets smaller.)
-3. **Lazy events** — `RawEvent`, envelope scanner, `LazyEvent` Starlark
-   view, batch/stream ingest endpoints. (Kills the allocation problem.)
-4. **Tier-1 prefilters** — `match` lowering, flat index with inline
-   predicates, parallel compile, pre-warmed snapshots. (Makes 10k rules
-   cheap.)
-5. **Cluster mode** — consistent-hash self-routing, peer discovery via
-   headless service, deployment manifests + Envoy example. (Makes 10M/sec a
-   replica count.)
+1. **Output decoupling + reload hygiene** — `Sink` interface, emission
+   policy, batched webhook; DuckDB stays in the default build but becomes
+   excludable via a build tag (and is simply not configured on the 10M
+   path). Reloader skips republishing when rule content is unchanged.
+   (Removes the first wall; no hot-path changes.)
+2. **Key-sharded execution** — hash dispatch, SPSC rings, counter shards
+   keyed by counter key (§4, replacing per-worker maps + `CounterSum`),
+   watchdog + step-limit timeouts, pooled results. The counter-affinity
+   check ships here behind a flag (a no-op for single-node, so the cluster
+   constraint is tested long before the cluster exists). (Hot path goes
+   timer-free and mostly lock-free; the code gets smaller.)
+3. **Lazy events** — `RawEvent`, envelope scanner, declared routing field
+   with `event_id` fallback, `LazyEvent` Starlark view, batch/stream ingest
+   endpoints. (Kills the allocation problem.)
+4. **Tier-1 prefilters** — `match` lowering with the fixed semantics of §3,
+   per-rule `prefiltered` metrics, flat index with inline predicates,
+   parallel compile, pre-warmed frozen snapshots. (Makes 10k rules cheap.)
+5. **Cluster mode** — consistent-hash self-routing with the one-hop
+   forwarded marker, batch splitting, peer discovery via headless service,
+   affinity check enforced, deployment manifests + Envoy example. (Makes
+   10M/sec a replica count.)
