@@ -25,10 +25,23 @@ type Snapshot struct {
 	ID       string
 	Rules    []Rule
 	LoadedAt time.Time
+
+	// byType maps each known event type to its matching rules (type-specific
+	// plus wildcard, in priority order). wildcard holds rules with
+	// event_type "*", returned for event types not present in byType.
+	byType   map[string][]Rule
+	wildcard []Rule
 }
 
 // RulesForEvent returns rules matching the given event type (including wildcard "*").
 func (s *Snapshot) RulesForEvent(eventType string) []Rule {
+	if s.byType != nil {
+		if matched, ok := s.byType[eventType]; ok {
+			return matched
+		}
+		return s.wildcard
+	}
+	// Fallback for snapshots constructed without buildIndex (e.g. in tests).
 	var matched []Rule
 	for _, r := range s.Rules {
 		if r.EventType == "*" || r.EventType == eventType {
@@ -36,6 +49,34 @@ func (s *Snapshot) RulesForEvent(eventType string) []Rule {
 		}
 	}
 	return matched
+}
+
+// buildIndex precomputes per-event-type rule lists so RulesForEvent is a
+// single map lookup with no per-event allocation. Rules must already be
+// sorted by priority.
+func (s *Snapshot) buildIndex() {
+	s.byType = make(map[string][]Rule)
+	s.wildcard = nil
+	for _, r := range s.Rules {
+		if r.EventType == "*" {
+			s.wildcard = append(s.wildcard, r)
+		}
+	}
+	for _, r := range s.Rules {
+		if r.EventType == "*" {
+			continue
+		}
+		if _, done := s.byType[r.EventType]; done {
+			continue
+		}
+		var matched []Rule
+		for _, r2 := range s.Rules {
+			if r2.EventType == "*" || r2.EventType == r.EventType {
+				matched = append(matched, r2)
+			}
+		}
+		s.byType[r.EventType] = matched
+	}
 }
 
 // Compiler loads and compiles Starlark rules.
@@ -86,11 +127,13 @@ func (c *Compiler) CompileDir(dir string) (*Snapshot, error) {
 		return nil, fmt.Errorf("generate snapshot ID: %w", err)
 	}
 
-	return &Snapshot{
+	snap := &Snapshot{
 		ID:       id.String(),
 		Rules:    rules,
 		LoadedAt: time.Now(),
-	}, nil
+	}
+	snap.buildIndex()
+	return snap, nil
 }
 
 // CompileSource compiles a single Starlark source string into a Rule.

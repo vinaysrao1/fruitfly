@@ -251,3 +251,29 @@ func TestEventID_TooLong_Returns400(t *testing.T) {
 		t.Error("expected empty channel after event_id too long rejection")
 	}
 }
+
+// TestEventID_256CharBoundary tests the exact boundary for event_id length.
+// T8: 256-char event_id is accepted (202), 257-char event_id is rejected (400).
+func TestEventID_256CharBoundary(t *testing.T) {
+	srv, ch := makeServer(2, 4096)
+
+	// 256 chars: exactly at limit, must be accepted.
+	id256 := strings.Repeat("a", 256)
+	body256 := `{"event_id": "` + id256 + `", "event_type": "test", "timestamp": "2024-01-15T10:30:00Z"}`
+	rr := post(srv, body256)
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("256-char event_id: want 202, got %d: %s", rr.Code, rr.Body.String())
+	}
+	<-ch
+
+	// 257 chars: one over the limit, must be rejected.
+	id257 := strings.Repeat("a", 257)
+	body257 := `{"event_id": "` + id257 + `", "event_type": "test", "timestamp": "2024-01-15T10:30:00Z"}`
+	rr2 := post(srv, body257)
+	if rr2.Code != http.StatusBadRequest {
+		t.Errorf("257-char event_id: want 400, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	if len(ch) != 0 {
+		t.Error("expected empty channel after 257-char event_id rejection")
+	}
+}

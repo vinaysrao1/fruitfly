@@ -53,6 +53,10 @@ type Result struct {
 	TriggeredRules []RuleResult
 	FailedRules    []RuleResult
 	Payload        map[string]any
-	LatencyUS      int64
-	ProcessedAt    time.Time
+	// RawPayload is the original event JSON as received. When set, sinks use
+	// it directly instead of re-marshalling Payload. Excluded from the
+	// webhook body, which already carries Payload.
+	RawPayload  []byte `json:"-"`
+	LatencyUS   int64
+	ProcessedAt time.Time
 }
