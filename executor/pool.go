@@ -16,11 +16,25 @@ import (
 
 const counterBucketSeconds int64 = 60
 const counterMaxWindowSeconds int64 = 3600 // must be >= max window used by any rule
+const counterSlots = counterMaxWindowSeconds / counterBucketSeconds
 
 type counterKey struct {
 	EntityID  string
 	EventType string
-	Bucket    int64
+}
+
+// counterSlot is one time bucket in a series ring. bucket holds the bucket
+// start (unix seconds, 0 = empty); both fields are atomic because workers
+// read each other's series via CounterSum.
+type counterSlot struct {
+	bucket atomic.Int64
+	count  atomic.Int64
+}
+
+// counterSeries is a fixed ring of buckets covering counterMaxWindowSeconds.
+// Only the owning worker writes; any worker may read.
+type counterSeries struct {
+	slots [counterSlots]counterSlot
 }
 
 type worker struct {
@@ -31,7 +45,7 @@ type worker struct {
 	// counters uses sync.Map because CounterSum reads across all workers concurrently.
 	// Each worker only writes to its own map, but cross-worker reads require thread safety.
 	// This is a pragmatic deviation from the no-locks design constraint.
-	counters  sync.Map // counterKey -> *atomic.Int64
+	counters  sync.Map // counterKey -> *counterSeries
 	evtCount  int
 	evalCache map[string]starlark.Callable // ruleID -> cached evaluate fn
 	evalSnap  string                       // snapshot ID that populated the cache
@@ -104,14 +118,17 @@ func (p *Pool) CounterSum(entityID, eventType string, windowSeconds int) int64 {
 }
 
 func (w *worker) counterQuery(entityID, eventType string, windowStart int64) int64 {
+	v, ok := w.counters.Load(counterKey{EntityID: entityID, EventType: eventType})
+	if !ok {
+		return 0
+	}
+	s := v.(*counterSeries)
 	var total int64
-	w.counters.Range(func(k, v any) bool {
-		key := k.(counterKey)
-		if key.EntityID == entityID && key.EventType == eventType && key.Bucket >= windowStart {
-			total += v.(*atomic.Int64).Load()
+	for i := range s.slots {
+		if s.slots[i].bucket.Load() >= windowStart {
+			total += s.slots[i].count.Load()
 		}
-		return true
-	})
+	}
 	return total
 }
 
@@ -146,6 +163,7 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 			ProcessedAt:  time.Now(),
 			LatencyUS:    time.Since(start).Microseconds(),
 			Payload:      event.Payload,
+			RawPayload:   event.RawJSON,
 		}
 	}
 
@@ -179,6 +197,7 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 		TriggeredRules: triggered,
 		FailedRules:    failed,
 		Payload:        event.Payload,
+		RawPayload:     event.RawJSON,
 		LatencyUS:      time.Since(start).Microseconds(),
 		ProcessedAt:    time.Now(),
 	}
@@ -205,16 +224,12 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 		},
 	}
 
-	// Cancel Starlark thread when context expires
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ruleCtx.Done():
-			thread.Cancel(ruleCtx.Err().Error())
-		case <-done:
-		}
-	}()
+	// Cancel Starlark thread when context expires. context.AfterFunc avoids
+	// spawning a watcher goroutine per rule evaluation.
+	stop := context.AfterFunc(ruleCtx, func() {
+		thread.Cancel(ruleCtx.Err().Error())
+	})
+	defer stop()
 
 	evalFn, cached := w.evalCache[rule.RuleID]
 	if !cached {
@@ -263,20 +278,36 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 	return
 }
 
+// gcCounters evicts series whose buckets have all aged out, bounding memory
+// when entity IDs have high cardinality.
 func (w *worker) gcCounters() {
 	cutoff := time.Now().Unix() - counterMaxWindowSeconds
 	w.counters.Range(func(k, v any) bool {
-		if k.(counterKey).Bucket < cutoff {
-			w.counters.Delete(k)
+		s := v.(*counterSeries)
+		for i := range s.slots {
+			if s.slots[i].bucket.Load() >= cutoff {
+				return true
+			}
 		}
+		w.counters.Delete(k)
 		return true
 	})
 }
 
 func (w *worker) counterIncrement(entityID, eventType string, unixNow int64) {
 	bucket := (unixNow / counterBucketSeconds) * counterBucketSeconds
-	key := counterKey{EntityID: entityID, EventType: eventType, Bucket: bucket}
-	actual, _ := w.counters.LoadOrStore(key, &atomic.Int64{})
-	ctr := actual.(*atomic.Int64)
-	ctr.Add(1)
+	key := counterKey{EntityID: entityID, EventType: eventType}
+	v, ok := w.counters.Load(key)
+	if !ok {
+		v, _ = w.counters.LoadOrStore(key, &counterSeries{})
+	}
+	s := v.(*counterSeries)
+	slot := &s.slots[(bucket/counterBucketSeconds)%counterSlots]
+	if slot.bucket.Load() != bucket {
+		// Reset count before publishing the new bucket so concurrent readers
+		// never attribute a stale count to the new bucket.
+		slot.count.Store(0)
+		slot.bucket.Store(bucket)
+	}
+	slot.count.Add(1)
 }

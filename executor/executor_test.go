@@ -778,64 +778,33 @@ def evaluate(event):
 	for range out {
 	}
 
-	// Inject an expired counter bucket into worker 0.
+	// Inject an expired counter series into worker 0 by incrementing with a
+	// timestamp old enough that all of its buckets predate the GC cutoff.
 	w := pool.workers[0]
-	expiredBucket := counterKey{
-		EntityID:  "expired-entity",
-		EventType: "post",
-		Bucket:    time.Now().Unix() - counterMaxWindowSeconds - 1,
-	}
-	var expiredCounter atomic.Int64
-	expiredCounter.Store(42)
-	w.counters.Store(expiredBucket, &expiredCounter)
+	expiredKey := counterKey{EntityID: "expired-entity", EventType: "post"}
+	w.counterIncrement("expired-entity", "post",
+		time.Now().Unix()-counterMaxWindowSeconds-counterBucketSeconds)
 
-	// Verify the expired bucket is present before GC.
-	var foundBefore bool
-	w.counters.Range(func(k, v any) bool {
-		if k.(counterKey) == expiredBucket {
-			foundBefore = true
-		}
-		return true
-	})
-	if !foundBefore {
-		t.Fatal("expired bucket not found in counters before GC")
+	// Verify the expired series is present before GC.
+	if _, ok := w.counters.Load(expiredKey); !ok {
+		t.Fatal("expired series not found in counters before GC")
 	}
 
 	// Trigger GC directly.
 	w.gcCounters()
 
-	// Verify expired bucket was deleted.
-	var foundAfter bool
-	w.counters.Range(func(k, v any) bool {
-		if k.(counterKey) == expiredBucket {
-			foundAfter = true
-		}
-		return true
-	})
-	if foundAfter {
-		t.Error("expired bucket still present after gcCounters() — expected it to be deleted")
+	// Verify expired series was deleted.
+	if _, ok := w.counters.Load(expiredKey); ok {
+		t.Error("expired series still present after gcCounters() — expected it to be deleted")
 	}
 
-	// Verify a non-expired bucket is retained.
-	freshBucket := counterKey{
-		EntityID:  "fresh-entity",
-		EventType: "post",
-		Bucket:    (time.Now().Unix() / counterBucketSeconds) * counterBucketSeconds,
-	}
-	var freshCounter atomic.Int64
-	freshCounter.Store(7)
-	w.counters.Store(freshBucket, &freshCounter)
+	// Verify a non-expired series is retained.
+	freshKey := counterKey{EntityID: "fresh-entity", EventType: "post"}
+	w.counterIncrement("fresh-entity", "post", time.Now().Unix())
 	w.gcCounters()
 
-	var foundFresh bool
-	w.counters.Range(func(k, v any) bool {
-		if k.(counterKey) == freshBucket {
-			foundFresh = true
-		}
-		return true
-	})
-	if !foundFresh {
-		t.Error("fresh bucket was deleted by gcCounters() — expected it to be retained")
+	if _, ok := w.counters.Load(freshKey); !ok {
+		t.Error("fresh series was deleted by gcCounters() — expected it to be retained")
 	}
 }
 

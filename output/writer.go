@@ -101,7 +101,7 @@ func (w *Writer) Run(ctx context.Context, in <-chan types.Result) error {
 			batch = append(batch, result)
 			if len(batch) >= batchSize {
 				w.flush(batch)
-				batch = batch[:0]
+				batch = resetBatch(batch)
 			}
 			select {
 			case w.webhookSem <- struct{}{}:
@@ -116,7 +116,7 @@ func (w *Writer) Run(ctx context.Context, in <-chan types.Result) error {
 		case <-flushTicker.C:
 			if len(batch) > 0 {
 				w.flush(batch)
-				batch = batch[:0]
+				batch = resetBatch(batch)
 			}
 
 		case <-retentionTicker.C:
@@ -138,7 +138,7 @@ func (w *Writer) Run(ctx context.Context, in <-chan types.Result) error {
 					batch = append(batch, result)
 					if len(batch) >= batchSize {
 						w.flush(batch)
-						batch = batch[:0]
+						batch = resetBatch(batch)
 					}
 				case <-drainCtx.Done():
 					w.flush(batch)
@@ -147,6 +147,13 @@ func (w *Writer) Run(ctx context.Context, in <-chan types.Result) error {
 			}
 		}
 	}
+}
+
+// resetBatch zeroes flushed elements so their payloads can be GC'd while the
+// backing array is reused.
+func resetBatch(batch []types.Result) []types.Result {
+	clear(batch)
+	return batch[:0]
 }
 
 func (w *Writer) flush(batch []types.Result) {
@@ -188,9 +195,12 @@ func (w *Writer) insertBatch(batch []types.Result) error {
 		if err != nil {
 			return fmt.Errorf("marshal failed_rules for %s: %w", r.EventID, err)
 		}
-		payloadJSON, err := json.Marshal(r.Payload)
-		if err != nil {
-			return fmt.Errorf("marshal payload for %s: %w", r.EventID, err)
+		payloadJSON := r.RawPayload
+		if len(payloadJSON) == 0 {
+			payloadJSON, err = json.Marshal(r.Payload)
+			if err != nil {
+				return fmt.Errorf("marshal payload for %s: %w", r.EventID, err)
+			}
 		}
 
 		processedAt := r.ProcessedAt
