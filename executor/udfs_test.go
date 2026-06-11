@@ -45,19 +45,19 @@ def evaluate(event):
 	}
 }
 
-// --- T5: anyToStarlark default case ---
+// --- T5: lazyConvert default case ---
 
-// T5: anyToStarlark with unrecognized type uses fmt.Sprintf("%v") coercion.
+// T5: lazyConvert with unrecognized type uses fmt.Sprintf("%v") coercion.
 func TestAnyToStarlark_UnrecognizedType(t *testing.T) {
 	now := time.Now()
-	result := anyToStarlark(now)
+	result := lazyConvert(now)
 
-	// The default case in anyToStarlark returns starlark.String(fmt.Sprintf("%v", val))
+	// The default case in lazyConvert returns starlark.String(fmt.Sprintf("%v", val))
 	expected := fmt.Sprintf("%v", now)
 
 	// Verify the result is non-nil
 	if result == nil {
-		t.Fatal("anyToStarlark returned nil for time.Time")
+		t.Fatal("lazyConvert returned nil for time.Time")
 	}
 
 	// starlark.String.String() returns quoted form like `"2006-01-02 ..."`,
@@ -68,11 +68,11 @@ func TestAnyToStarlark_UnrecognizedType(t *testing.T) {
 	}
 	unquoted := resultStr[1 : len(resultStr)-1]
 	if unquoted != expected {
-		t.Errorf("anyToStarlark(%T) = %q, want %q", now, unquoted, expected)
+		t.Errorf("lazyConvert(%T) = %q, want %q", now, unquoted, expected)
 	}
 }
 
-// Table-driven tests for anyToStarlark recognized types.
+// Table-driven tests for lazyConvert recognized types.
 func TestAnyToStarlark_KnownTypes(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -119,7 +119,7 @@ func TestAnyToStarlark_KnownTypes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := anyToStarlark(tt.input)
+			result := lazyConvert(tt.input)
 			tt.check(t, result)
 		})
 	}

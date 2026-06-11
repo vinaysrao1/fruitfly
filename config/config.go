@@ -21,6 +21,15 @@ type Config struct {
 	// verdicts and rule failures, counting plain approvals in metrics —
 	// the high-throughput setting.
 	Emit string `yaml:"emit"`
+	// RoutingField names the payload field used as the routing key
+	// (default "entity_id"); events without it route by event ID.
+	RoutingField string `yaml:"routing_field"`
+	// ClusterPeers lists every peer's base URL (including this process's
+	// own, identified by ClusterSelf). Empty means single-node. Ownership
+	// of a routing key is decided by rendezvous hashing over this list, so
+	// all peers must share the same list.
+	ClusterPeers []string `yaml:"cluster_peers"`
+	ClusterSelf  string   `yaml:"cluster_self"`
 }
 
 // Load reads a YAML config file and returns a Config with defaults applied.
@@ -74,6 +83,13 @@ func Load(path string) (*Config, error) {
 		// valid
 	default:
 		return nil, fmt.Errorf("invalid emit %q (must be all or interesting)", cfg.Emit)
+	}
+
+	if cfg.RoutingField == "" {
+		cfg.RoutingField = "entity_id"
+	}
+	if len(cfg.ClusterPeers) > 0 && cfg.ClusterSelf == "" {
+		return nil, fmt.Errorf("cluster_self is required when cluster_peers is set")
 	}
 
 	return cfg, nil

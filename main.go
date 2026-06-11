@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vinaysrao1/fruitfly/cluster"
 	"github.com/vinaysrao1/fruitfly/config"
 	"github.com/vinaysrao1/fruitfly/executor"
 	"github.com/vinaysrao1/fruitfly/ingest"
@@ -87,12 +88,29 @@ func main() {
 
 	// Initialize ingest server.
 	ingestServer := ingest.NewServer(cfg.Address, maxEventBytes, eventChan)
+	ingestServer.SetRoutingField(cfg.RoutingField)
+
+	// Cluster mode: route events to their owning peer by entity hash, and
+	// restrict counter() keys to the routing entity so counts stay exact
+	// across pods.
+	if len(cfg.ClusterPeers) > 0 {
+		router, err := cluster.NewRouter(cfg.ClusterSelf, cfg.ClusterPeers)
+		if err != nil {
+			slog.Error("invalid cluster configuration", "error", err)
+			os.Exit(1)
+		}
+		ingestServer.SetRouter(router)
+		pool.SetCounterAffinity(true)
+		slog.Info("cluster mode enabled", "self", cfg.ClusterSelf, "peers", len(cfg.ClusterPeers))
+	}
 
 	// Build HTTP mux.
 	mux := http.NewServeMux()
 
-	// Mount ingest handler - it already has POST /events registered.
+	// Mount ingest routes. Go 1.22 ServeMux patterns are exact-match, so
+	// "/events" alone would 404 "/events/batch"; register the subtree too.
 	mux.Handle("/events", ingestServer.Handler())
+	mux.Handle("/events/", ingestServer.Handler())
 
 	// Admin: liveness check (always 200).
 	mux.HandleFunc("GET /admin/health", func(w http.ResponseWriter, r *http.Request) {
@@ -118,9 +136,10 @@ func main() {
 			return
 		}
 		type ruleInfo struct {
-			RuleID    string `json:"rule_id"`
-			EventType string `json:"event_type"`
-			Priority  int    `json:"priority"`
+			RuleID      string `json:"rule_id"`
+			EventType   string `json:"event_type"`
+			Priority    int    `json:"priority"`
+			Prefiltered int64  `json:"prefiltered"`
 		}
 		type response struct {
 			ID        string     `json:"id"`
@@ -131,9 +150,10 @@ func main() {
 		ruleInfos := make([]ruleInfo, len(snap.Rules))
 		for i, r := range snap.Rules {
 			ruleInfos[i] = ruleInfo{
-				RuleID:    r.RuleID,
-				EventType: r.EventType,
-				Priority:  r.Priority,
+				RuleID:      r.RuleID,
+				EventType:   r.EventType,
+				Priority:    r.Priority,
+				Prefiltered: r.Prefiltered.Load(),
 			}
 		}
 		resp := response{

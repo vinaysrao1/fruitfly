@@ -54,6 +54,36 @@ verdict("review", reason="borderline score") # flag for human review
 | `hash(value)` | SHA256 hex string | `hash(email)` |
 | `regex_match(pattern, text)` | Test regex match | `regex_match("^spam", subject)` |
 
+## Tier-1 Prefilters (`match`)
+
+A rule may declare an optional `match` global: native predicates evaluated
+in nanoseconds before any Starlark runs. If any clause fails, the rule is
+skipped silently (counted per rule as `prefiltered` in `/admin/rules`).
+
+```python
+match = {
+    "all": [                                  # every clause must pass
+        ["payload.char_count", "<", 20],      # numbers compare as float64
+        ["payload.lang", "in", ["en", "es"]], # list must be homogeneous
+    ],
+}
+```
+
+Supported ops: `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `exists`, `prefix`.
+Paths address the event envelope (`payload.*`, `event_type`, `event_id`,
+`entity_id`, `timestamp`). A missing or type-mismatched field makes the
+clause false — the rule is skipped, never errored; use `exists` to test
+presence explicitly.
+
+## Cluster mode and counter keys
+
+In cluster mode (`cluster_peers` configured), `counter()` keys must be
+affine to the event's routing entity: the entity itself or a scoped
+derivation like `entity + ":likes"`. Any other key is a rule error — it
+would scatter increments across pods and silently undercount. To count by
+another perspective (e.g. recipient on a sender-routed event), emit a
+second event routed by that perspective.
+
 ## Examples
 
 ### Spam Filter

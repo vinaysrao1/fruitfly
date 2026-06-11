@@ -116,6 +116,31 @@ log_level: "info"             # debug | info | warn | error
 
 `event_id` is auto-generated (UUIDv7) if omitted.
 
+### Batch ingestion
+
+`POST /events/batch` accepts NDJSON — one event per line. Invalid or
+oversized lines are rejected individually; the response reports
+`{"accepted": n, "forwarded": n, "rejected": n}`. On backpressure the
+remainder is rejected and the status is 429.
+
+### Horizontal scaling
+
+Run the same binary on every pod with a shared static peer list:
+
+```yaml
+routing_field: entity_id        # payload field used as the routing key
+cluster_self: http://pod-0:8080
+cluster_peers:
+  - http://pod-0:8080
+  - http://pod-1:8080
+```
+
+Events are routed to the pod owning their entity (rendezvous hashing, at
+most one forwarding hop), so sliding-window counters stay exact across the
+cluster. In cluster mode, `counter()` keys must be the routing entity or an
+`entity:scope` derivation. For high throughput set `emit: interesting` so
+only non-approve verdicts and rule failures are persisted/webhooked.
+
 ### Response codes
 
 | Code | Meaning |

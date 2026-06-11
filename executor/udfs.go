@@ -82,6 +82,13 @@ func counterUDF(w *worker) func(*starlark.Thread, *starlark.Builtin, starlark.Tu
 			// one failure mode a rate-limiting primitive must not have.
 			return nil, fmt.Errorf("counter: window_seconds must be <= %d", counterMaxWindowSeconds)
 		}
+		if w.pool.counterAffinity && !affineKey(entityID, w.curEntity) {
+			// Cluster mode: a key other than the routing entity would
+			// scatter increments across pods' private stores and silently
+			// undercount. Count by another perspective via producer-side
+			// event fan-out (docs/SCALING_10M.md §6).
+			return nil, fmt.Errorf("counter: key %q is not affine to routing entity %q (cluster mode requires the routing entity or a \"<entity>:<scope>\" derivation)", entityID, w.curEntity)
+		}
 		now := time.Now().Unix()
 		w.pool.counters.increment(entityID, eventType, now)
 		total := w.pool.CounterSum(entityID, eventType, windowSeconds)
@@ -109,6 +116,14 @@ func hashUDF(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, 
 	}
 	sum := sha256.Sum256([]byte(value))
 	return starlark.String(fmt.Sprintf("%x", sum)), nil
+}
+
+// affineKey reports whether a counter key is affine to the routing entity:
+// the entity itself or a scoped derivation like "user-7:likes". Affine keys
+// always live on the entity's home pod, so cross-pod counts stay exact.
+func affineKey(key, entity string) bool {
+	return key == entity ||
+		(len(key) > len(entity)+1 && key[len(entity)] == ':' && key[:len(entity)] == entity)
 }
 
 func regexMatchUDF(w *worker) func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
