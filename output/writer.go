@@ -31,6 +31,54 @@ type Writer struct {
 	webhookClient *http.Client
 	webhookSem    chan struct{}
 	Ready         atomic.Bool
+
+	// emitInteresting, when set, persists and webhooks only "interesting"
+	// results — non-approve verdicts or rule failures. Plain approvals are
+	// counted in stats and dropped, which removes the output path as the
+	// throughput ceiling. Set before Run.
+	emitInteresting bool
+
+	stats struct {
+		approve, block, review atomic.Int64 // all results, by verdict
+		errored                atomic.Int64 // results with >=1 failed rule
+		skipped                atomic.Int64 // results dropped by emit policy
+	}
+}
+
+// SetEmitInteresting selects the "interesting-only" emission policy.
+// Must be called before Run.
+func (w *Writer) SetEmitInteresting(on bool) { w.emitInteresting = on }
+
+// Stats returns cumulative result counts for the metrics endpoint.
+func (w *Writer) Stats() map[string]int64 {
+	return map[string]int64{
+		"results_approve": w.stats.approve.Load(),
+		"results_block":   w.stats.block.Load(),
+		"results_review":  w.stats.review.Load(),
+		"results_errored": w.stats.errored.Load(),
+		"results_skipped": w.stats.skipped.Load(),
+	}
+}
+
+// observe records a result in stats and reports whether the emission policy
+// keeps it (persist + webhook) or drops it.
+func (w *Writer) observe(r types.Result) (keep bool) {
+	switch r.FinalVerdict {
+	case types.VerdictBlock:
+		w.stats.block.Add(1)
+	case types.VerdictReview:
+		w.stats.review.Add(1)
+	default:
+		w.stats.approve.Add(1)
+	}
+	if len(r.FailedRules) > 0 {
+		w.stats.errored.Add(1)
+	}
+	if w.emitInteresting && r.FinalVerdict == types.VerdictApprove && len(r.FailedRules) == 0 {
+		w.stats.skipped.Add(1)
+		return false
+	}
+	return true
 }
 
 // NewWriter opens DuckDB at dbPath, creates the results table, returns Writer.
@@ -98,6 +146,9 @@ func (w *Writer) Run(ctx context.Context, in <-chan types.Result) error {
 				w.flush(batch)
 				return w.Close()
 			}
+			if !w.observe(result) {
+				continue
+			}
 			batch = append(batch, result)
 			if len(batch) >= batchSize {
 				w.flush(batch)
@@ -134,6 +185,9 @@ func (w *Writer) Run(ctx context.Context, in <-chan types.Result) error {
 					if !ok {
 						w.flush(batch)
 						return w.Close()
+					}
+					if !w.observe(result) {
+						continue
 					}
 					batch = append(batch, result)
 					if len(batch) >= batchSize {
@@ -252,7 +306,8 @@ func (w *Writer) sendWebhook(ctx context.Context, result types.Result) {
 		return
 	}
 
-	for attempt := 0; attempt < 3; attempt++ {
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.webhookURL, bytes.NewReader(body))
 		if err != nil {
 			slog.Error("webhook: build request failed", "event_id", result.EventID, "error", err)
@@ -271,6 +326,9 @@ func (w *Writer) sendWebhook(ctx context.Context, result types.Result) {
 					"event_id", result.EventID, "status", resp.StatusCode)
 				return
 			}
+		}
+		if attempt == maxAttempts-1 {
+			break // no point sleeping after the final attempt
 		}
 
 		backoff := time.Duration(100*(1<<attempt)) * time.Millisecond

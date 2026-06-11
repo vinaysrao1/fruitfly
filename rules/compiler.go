@@ -53,30 +53,45 @@ func (s *Snapshot) RulesForEvent(eventType string) []Rule {
 
 // buildIndex precomputes per-event-type rule lists so RulesForEvent is a
 // single map lookup with no per-event allocation. Rules must already be
-// sorted by priority.
+// sorted by priority descending; the merge preserves that order. (Ties
+// between a wildcard and a type-specific rule prefer the type-specific
+// one — equal-priority order is unspecified anyway since the sort is not
+// stable.) One pass over the rules plus one merge per type: O(N + T*W)
+// instead of O(N*T).
 func (s *Snapshot) buildIndex() {
 	s.byType = make(map[string][]Rule)
 	s.wildcard = nil
 	for _, r := range s.Rules {
 		if r.EventType == "*" {
 			s.wildcard = append(s.wildcard, r)
+		} else {
+			s.byType[r.EventType] = append(s.byType[r.EventType], r)
 		}
 	}
-	for _, r := range s.Rules {
-		if r.EventType == "*" {
-			continue
-		}
-		if _, done := s.byType[r.EventType]; done {
-			continue
-		}
-		var matched []Rule
-		for _, r2 := range s.Rules {
-			if r2.EventType == "*" || r2.EventType == r.EventType {
-				matched = append(matched, r2)
-			}
-		}
-		s.byType[r.EventType] = matched
+	if len(s.wildcard) == 0 {
+		return
 	}
+	for t, list := range s.byType {
+		s.byType[t] = mergeByPriority(list, s.wildcard)
+	}
+}
+
+// mergeByPriority merges two priority-descending rule slices into a new
+// priority-descending slice.
+func mergeByPriority(a, b []Rule) []Rule {
+	out := make([]Rule, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i].Priority >= b[j].Priority {
+			out = append(out, a[i])
+			i++
+		} else {
+			out = append(out, b[j])
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	return append(out, b[j:]...)
 }
 
 // Compiler loads and compiles Starlark rules.

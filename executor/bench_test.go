@@ -13,35 +13,29 @@ import (
 	"go.starlark.net/starlark"
 )
 
-// setupCounterPool builds a pool with manually-initialized workers and
-// populates counters for `entities` distinct entity IDs, three buckets each.
+// setupCounterPool builds a pool and populates counters for `entities`
+// distinct entity IDs, three buckets each.
 func setupCounterPool(workers, entities int) *Pool {
 	var ptr atomic.Pointer[rules.Snapshot]
 	pool := NewPool(workers, &ptr, 5*time.Second, time.Second)
-	pool.workers = make([]*worker, workers)
-	for i := range pool.workers {
-		pool.workers[i] = &worker{id: i, pool: pool}
-	}
 	now := time.Now().Unix()
 	for e := 0; e < entities; e++ {
-		w := pool.workers[e%workers]
 		id := fmt.Sprintf("entity-%d", e)
-		w.counterIncrement(id, "post", now)
-		w.counterIncrement(id, "post", now-120)
-		w.counterIncrement(id, "post", now-600)
+		pool.counters.increment(id, "post", now)
+		pool.counters.increment(id, "post", now-120)
+		pool.counters.increment(id, "post", now-600)
 	}
 	return pool
 }
 
 // benchCounter measures the cost of one counter() UDF call:
-// one increment plus one cross-worker CounterSum.
+// one increment plus one CounterSum read.
 func benchCounter(b *testing.B, entities int) {
 	pool := setupCounterPool(4, entities)
 	now := time.Now().Unix()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		w := pool.workers[i%4]
-		w.counterIncrement("entity-42", "post", now)
+		pool.counters.increment("entity-42", "post", now)
 		pool.CounterSum("entity-42", "post", 3600)
 	}
 }

@@ -745,28 +745,13 @@ def evaluate(event):
 
 // --- T20: Counter concurrency stress ---
 
-// T20: Concurrent counterIncrement (writers) and CounterSum (readers) on the same pool.
-// Verifies no data race (run with -race).
-//
-// Design: directly exercise the counter sync primitives without going through pool.Run,
-// since pool.Run writes pool.workers which creates a race with CounterSum readers.
-// Instead, manually create workers and use the counter primitives directly.
+// T20: Concurrent increments (writers) and CounterSum (readers) on the same
+// pool. The key-sharded store supports any number of concurrent writers per
+// key with exact counts, so this asserts exactness as well as race-freedom
+// (run with -race).
 func TestCounterConcurrency_Stress(t *testing.T) {
 	var ptr atomic.Pointer[rules.Snapshot]
 	pool := NewPool(4, &ptr, 5*time.Second, 1*time.Second)
-
-	// Manually create workers so we can exercise counter concurrency.
-	// This direct assignment is safe because no goroutines are started yet —
-	// all writer and reader goroutines are launched AFTER pool.workers is fully
-	// initialized, so there is no concurrent access at this point.
-	pool.workers = make([]*worker, 4)
-	for i := range pool.workers {
-		w := &worker{
-			id:   i,
-			pool: pool,
-		}
-		pool.workers[i] = w
-	}
 
 	const goroutines = 8
 	const incrementsPerGoroutine = 100
@@ -775,15 +760,13 @@ func TestCounterConcurrency_Stress(t *testing.T) {
 	var wg sync.WaitGroup
 	now := time.Now().Unix()
 
-	// Writers: goroutines incrementing counters via different workers.
+	// Writers: goroutines incrementing the same key concurrently.
 	for i := 0; i < goroutines; i++ {
-		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			w := pool.workers[i%len(pool.workers)]
 			for j := 0; j < incrementsPerGoroutine; j++ {
-				w.counterIncrement("stress-entity", "post", now)
+				pool.counters.increment("stress-entity", "post", now)
 			}
 		}()
 	}
@@ -820,58 +803,87 @@ func TestCounterConcurrency_Stress(t *testing.T) {
 
 // --- T29: Counter GC threshold ---
 
-// T29: Directly exercise gcCounters() to verify expired bucket deletion.
-// pool.Run() resets workers on each call, so we use a single-event run to populate
-// pool.workers, then inject expired buckets and call gcCounters() directly.
+// T29: Directly exercise counter GC to verify expired series deletion.
 func TestCounterGC_Threshold(t *testing.T) {
-	snap := compileRule(t, `
-rule_id = "gc-rule"
-event_type = "post"
-priority = 100
-def evaluate(event):
-    return verdict("approve")
-`)
-
 	var ptr atomic.Pointer[rules.Snapshot]
-	ptr.Store(snap)
 	pool := NewPool(1, &ptr, 5*time.Second, 1*time.Second)
 
-	// Run 1 event to initialize pool.workers so we can access workers[0].
-	in := make(chan types.Event, 1)
-	out := make(chan types.Result, 1)
-	in <- testEvent("post", nil)
-	close(in)
-	pool.Run(context.Background(), in, out)
-	for range out {
-	}
-
-	// Inject an expired counter series into worker 0 by incrementing with a
-	// timestamp old enough that all of its buckets predate the GC cutoff.
-	w := pool.workers[0]
+	// Create an expired series by incrementing with a timestamp old enough
+	// that all of its buckets predate the GC cutoff.
 	expiredKey := counterKey{EntityID: "expired-entity", EventType: "post"}
-	w.counterIncrement("expired-entity", "post",
+	pool.counters.increment("expired-entity", "post",
 		time.Now().Unix()-counterMaxWindowSeconds-counterBucketSeconds)
 
 	// Verify the expired series is present before GC.
-	if _, ok := w.counters.Load(expiredKey); !ok {
+	if _, ok := pool.counters.shards[expiredKey.shard()].Load(expiredKey); !ok {
 		t.Fatal("expired series not found in counters before GC")
 	}
 
 	// Trigger GC directly.
-	w.gcCounters()
+	pool.counters.gc(time.Now().Unix())
 
 	// Verify expired series was deleted.
-	if _, ok := w.counters.Load(expiredKey); ok {
-		t.Error("expired series still present after gcCounters() — expected it to be deleted")
+	if _, ok := pool.counters.shards[expiredKey.shard()].Load(expiredKey); ok {
+		t.Error("expired series still present after gc — expected it to be deleted")
 	}
 
 	// Verify a non-expired series is retained.
 	freshKey := counterKey{EntityID: "fresh-entity", EventType: "post"}
-	w.counterIncrement("fresh-entity", "post", time.Now().Unix())
-	w.gcCounters()
+	pool.counters.increment("fresh-entity", "post", time.Now().Unix())
+	pool.counters.gc(time.Now().Unix())
 
-	if _, ok := w.counters.Load(freshKey); !ok {
-		t.Error("fresh series was deleted by gcCounters() — expected it to be retained")
+	if _, ok := pool.counters.shards[freshKey.shard()].Load(freshKey); !ok {
+		t.Error("fresh series was deleted by gc — expected it to be retained")
+	}
+}
+
+// TestCounterWindow_CapEnforced: counters retain counterMaxWindowSeconds of
+// history, so a larger window must be a rule error (with a serializable
+// message), never a silently truncated count.
+func TestCounterWindow_CapEnforced(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "big-window"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    val = counter("user", "post", 86400)
+    return verdict("approve")
+`)
+	pool, _ := makePool(snap, 1)
+	result := runSingleEvent(t, pool, testEvent("post", nil))
+
+	if len(result.FailedRules) != 1 {
+		t.Fatalf("FailedRules len = %d, want 1 (oversized window must error)", len(result.FailedRules))
+	}
+	rr := result.FailedRules[0]
+	if !strings.Contains(rr.Err.Error(), "window_seconds") {
+		t.Errorf("error = %v, want mention of window_seconds", rr.Err)
+	}
+	if rr.ErrMsg == "" || rr.ErrMsg != rr.Err.Error() {
+		t.Errorf("ErrMsg = %q, want the serializable copy of Err (%v)", rr.ErrMsg, rr.Err)
+	}
+}
+
+// TestCounterSeries_WindowFiltering: increments in different buckets are
+// included or excluded by the window boundary.
+func TestCounterSeries_WindowFiltering(t *testing.T) {
+	var ptr atomic.Pointer[rules.Snapshot]
+	pool := NewPool(1, &ptr, 5*time.Second, 1*time.Second)
+
+	now := time.Now().Unix()
+	pool.counters.increment("user", "post", now)
+	pool.counters.increment("user", "post", now-120) // two buckets back
+
+	// Use explicit window starts: CounterSum derives the window from
+	// time.Now(), which would race the minute boundary in a test.
+	if got := pool.counters.sum("user", "post", now-59); got != 1 {
+		t.Errorf("sum(59s window) = %d, want 1 (older bucket outside window)", got)
+	}
+	if got := pool.counters.sum("user", "post", now-3600); got != 2 {
+		t.Errorf("sum(3600s window) = %d, want 2", got)
+	}
+	if got := pool.CounterSum("other", "post", 3600); got != 0 {
+		t.Errorf("CounterSum(unknown key) = %d, want 0", got)
 	}
 }
 

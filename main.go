@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -78,6 +80,7 @@ func main() {
 		slog.Error("failed to open DuckDB", "path", cfg.DuckDBPath, "error", err)
 		os.Exit(1)
 	}
+	writer.SetEmitInteresting(cfg.Emit == "interesting")
 
 	// Initialize executor pool.
 	pool := executor.NewPool(cfg.Workers, &snapshotPtr, eventTimeout, ruleTimeout)
@@ -150,10 +153,18 @@ func main() {
 		w.Write([]byte("reload triggered"))
 	})
 
-	// Admin: metrics placeholder.
+	// Admin: result counters in Prometheus text format.
 	mux.HandleFunc("GET /admin/metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte("# metrics placeholder\n"))
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		stats := writer.Stats()
+		names := make([]string, 0, len(stats))
+		for name := range stats {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Fprintf(w, "fruitfly_%s %d\n", name, stats[name])
+		}
 	})
 
 	// Two separate lifecycles. reloadCtx stops background services. pipeCtx

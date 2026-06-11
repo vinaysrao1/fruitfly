@@ -76,8 +76,14 @@ func counterUDF(w *worker) func(*starlark.Thread, *starlark.Builtin, starlark.Tu
 		if windowSeconds < 1 {
 			return nil, fmt.Errorf("counter: window_seconds must be >= 1")
 		}
+		if int64(windowSeconds) > counterMaxWindowSeconds {
+			// Counters retain counterMaxWindowSeconds of history; a larger
+			// window would silently return a truncated count, which is the
+			// one failure mode a rate-limiting primitive must not have.
+			return nil, fmt.Errorf("counter: window_seconds must be <= %d", counterMaxWindowSeconds)
+		}
 		now := time.Now().Unix()
-		w.counterIncrement(entityID, eventType, now)
+		w.pool.counters.increment(entityID, eventType, now)
 		total := w.pool.CounterSum(entityID, eventType, windowSeconds)
 		return starlark.MakeInt64(total), nil
 	}

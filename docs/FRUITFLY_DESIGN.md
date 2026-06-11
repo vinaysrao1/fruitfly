@@ -307,21 +307,28 @@ This means: if rules at priority 100 all return "approve" but a rule at priority
 
 ### In-Memory Counters
 
-Each worker maintains its own time-bucketed counter map using `atomic.Int64` values (`map[counterKey]*atomic.Int64`). Workers increment their local counters atomically.
+Counters live in a pool-level store sharded by counter key: 256 shards, each
+a `sync.Map` of `counterKey -> *counterSeries`, with the shard chosen by a
+hash of (entity ID, event type). A series is a fixed ring of 60 one-minute
+buckets; each bucket packs its epoch and count into a single `atomic.Uint64`
+updated by CAS, so increments are lock-free and exact under any number of
+concurrent writers.
 
-The `counter()` UDF does **not** query a single worker's shard. Instead, it calls a pool-level `CounterSum` method that reads across all workers:
+The `counter()` UDF increments the key's home shard and reads it back via
+the pool-level `CounterSum`:
 
 ```go
 func (p *Pool) CounterSum(entityID, eventType string, windowSeconds int) int64 {
-    var total int64
-    for _, w := range p.workers {
-        total += w.counterQuery(entityID, eventType, windowSeconds)
-    }
-    return total
+    windowStart := time.Now().Unix() - int64(windowSeconds)
+    return p.counters.sum(entityID, eventType, windowStart)
 }
 ```
 
-Each `counterQuery` reads `atomic.Int64` values -- no mutex, no locks, ~1ns per atomic read. At 8 workers this summation takes nanoseconds. This preserves the no-locks constraint while giving correct cross-worker counts. Without this, per-worker-only counters undercount by a factor of N (worker count), making rate-limiting rules like `counter("user:123", "post", 3600) > 10` effectively useless.
+A read touches exactly one shard -- one map lookup plus 60 atomic loads,
+independent of worker count and entity cardinality. Every key has a single
+home shard rather than one copy per worker, so counts are exact without any
+cross-worker aggregation, and there are no locks on the hot path. A
+background ticker evicts series whose buckets have all aged out.
 
 ### Timeouts
 
