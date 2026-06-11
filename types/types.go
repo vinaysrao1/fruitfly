@@ -41,7 +41,10 @@ type RuleResult struct {
 	RuleID  string
 	Verdict Verdict
 	Reason  string
-	Err     error
+	// Err is the in-process error; bare errors marshal as "{}", so ErrMsg
+	// carries the message for DuckDB rows and webhook bodies.
+	Err     error `json:"-"`
+	ErrMsg  string
 	Elapsed time.Duration
 }
 

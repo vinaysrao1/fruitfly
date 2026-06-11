@@ -16,6 +16,11 @@ type Config struct {
 	WebhookURL string `yaml:"webhook_url"`
 	Workers    int    `yaml:"workers"`
 	LogLevel   string `yaml:"log_level"`
+	// Emit selects the output emission policy: "all" persists and webhooks
+	// every result (the default); "interesting" emits only non-approve
+	// verdicts and rule failures, counting plain approvals in metrics —
+	// the high-throughput setting.
+	Emit string `yaml:"emit"`
 }
 
 // Load reads a YAML config file and returns a Config with defaults applied.
@@ -53,12 +58,22 @@ func Load(path string) (*Config, error) {
 	if cfg.Workers <= 0 {
 		cfg.Workers = runtime.NumCPU()
 	}
+	if cfg.Emit == "" {
+		cfg.Emit = "all"
+	}
 
 	switch cfg.LogLevel {
 	case "debug", "info", "warn", "error":
 		// valid
 	default:
 		return nil, fmt.Errorf("invalid log_level %q (must be debug, info, warn, or error)", cfg.LogLevel)
+	}
+
+	switch cfg.Emit {
+	case "all", "interesting":
+		// valid
+	default:
+		return nil, fmt.Errorf("invalid emit %q (must be all or interesting)", cfg.Emit)
 	}
 
 	return cfg, nil

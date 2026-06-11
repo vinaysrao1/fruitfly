@@ -159,9 +159,9 @@ func TestRulesForEvent_FilterAndWildcard(t *testing.T) {
 	c := newTestCompiler()
 	dir := t.TempDir()
 
-	copyTestFile(t, "testdata/high_priority.star", dir)  // event_type = "post"
-	copyTestFile(t, "testdata/mid_priority.star", dir)   // event_type = "comment"
-	copyTestFile(t, "testdata/wildcard_rule.star", dir)  // event_type = "*"
+	copyTestFile(t, "testdata/high_priority.star", dir) // event_type = "post"
+	copyTestFile(t, "testdata/mid_priority.star", dir)  // event_type = "comment"
+	copyTestFile(t, "testdata/wildcard_rule.star", dir) // event_type = "*"
 
 	snap, err := c.CompileDir(dir)
 	if err != nil {
@@ -333,6 +333,68 @@ def evaluate(event)
 	}
 	if currentSnap.Rules[0].RuleID != "stable-rule" {
 		t.Errorf("expected rule 'stable-rule', got %q", currentSnap.Rules[0].RuleID)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestReloader_UnchangedContent_KeepsSnapshot: a reload with unchanged rule
+// content must not republish — republishing would mint a new snapshot ID and
+// needlessly invalidate every worker's eval cache.
+func TestReloader_UnchangedContent_KeepsSnapshot(t *testing.T) {
+	c := newTestCompiler()
+	dir := t.TempDir()
+
+	writeFile(t, filepath.Join(dir, "rule.star"), `
+rule_id = "steady-rule"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    return verdict("approve")
+`)
+
+	var snap atomic.Pointer[Snapshot]
+	reloader, err := NewReloader(c, dir, &snap)
+	if err != nil {
+		t.Fatalf("NewReloader: %v", err)
+	}
+	initialID := snap.Load().ID
+
+	// Trigger a manual reload with no content change.
+	reloader.Reload()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		_ = reloader.Run(ctx)
+		close(done)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	if got := snap.Load().ID; got != initialID {
+		t.Errorf("snapshot ID changed on unchanged content: %s -> %s", initialID, got)
+	}
+
+	// A real content change must still publish a new snapshot.
+	writeFile(t, filepath.Join(dir, "rule.star"), `
+rule_id = "steady-rule"
+event_type = "post"
+priority = 200
+def evaluate(event):
+    return verdict("approve")
+`)
+	reloader.Reload()
+
+	deadline := time.After(3 * time.Second)
+	for snap.Load().ID == initialID {
+		select {
+		case <-deadline:
+			t.Fatal("snapshot did not update after content change")
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 
 	cancel()

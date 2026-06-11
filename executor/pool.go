@@ -14,42 +14,14 @@ import (
 	"go.starlark.net/starlark"
 )
 
-const counterBucketSeconds int64 = 60
-const counterMaxWindowSeconds int64 = 3600 // must be >= max window used by any rule
-const counterSlots = counterMaxWindowSeconds / counterBucketSeconds
-
-type counterKey struct {
-	EntityID  string
-	EventType string
-}
-
-// counterSlot is one time bucket in a series ring. bucket holds the bucket
-// start (unix seconds, 0 = empty); both fields are atomic because workers
-// read each other's series via CounterSum.
-type counterSlot struct {
-	bucket atomic.Int64
-	count  atomic.Int64
-}
-
-// counterSeries is a fixed ring of buckets covering counterMaxWindowSeconds.
-// Only the owning worker writes; any worker may read.
-type counterSeries struct {
-	slots [counterSlots]counterSlot
-}
-
 type worker struct {
 	id         int
 	pool       *Pool
 	memo       map[string]any
 	regexCache map[string]*regexp.Regexp
-	// counters uses sync.Map because CounterSum reads across all workers concurrently.
-	// Each worker only writes to its own map, but cross-worker reads require thread safety.
-	// This is a pragmatic deviation from the no-locks design constraint.
-	counters  sync.Map // counterKey -> *counterSeries
-	evtCount  int
-	evalCache map[string]starlark.Callable // ruleID -> cached evaluate fn
-	evalSnap  string                       // snapshot ID that populated the cache
-	udfs      starlark.StringDict          // worker-lifetime UDFs (built once)
+	evalCache  map[string]starlark.Callable // ruleID -> cached evaluate fn
+	evalSnap   string                       // snapshot ID that populated the cache
+	udfs       starlark.StringDict          // worker-lifetime UDFs (built once)
 }
 
 // Pool manages worker goroutines that evaluate rules against events.
@@ -58,6 +30,7 @@ type Pool struct {
 	snapshot     *atomic.Pointer[rules.Snapshot]
 	eventTimeout time.Duration
 	ruleTimeout  time.Duration
+	counters     counterStore
 	workers      []*worker
 }
 
@@ -101,35 +74,33 @@ func (p *Pool) Run(ctx context.Context, in <-chan types.Event, out chan<- types.
 		}()
 	}
 
+	// Evict aged-out counter series once a minute while workers run.
+	gcDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-gcDone:
+				return
+			case <-ticker.C:
+				p.counters.gc(time.Now().Unix())
+			}
+		}
+	}()
+
 	wg.Wait()
+	close(gcDone)
 	close(out)
 }
 
-// CounterSum returns the sum of counter values across all workers.
+// CounterSum returns the total count for (entityID, eventType) within the
+// trailing window. Counters live in a key-sharded store, so this is a
+// single-shard read regardless of worker count. windowSeconds must be
+// between 1 and counterMaxWindowSeconds.
 func (p *Pool) CounterSum(entityID, eventType string, windowSeconds int) int64 {
-	now := time.Now().Unix()
-	windowStart := now - int64(windowSeconds)
-
-	var total int64
-	for _, w := range p.workers {
-		total += w.counterQuery(entityID, eventType, windowStart)
-	}
-	return total
-}
-
-func (w *worker) counterQuery(entityID, eventType string, windowStart int64) int64 {
-	v, ok := w.counters.Load(counterKey{EntityID: entityID, EventType: eventType})
-	if !ok {
-		return 0
-	}
-	s := v.(*counterSeries)
-	var total int64
-	for i := range s.slots {
-		if s.slots[i].bucket.Load() >= windowStart {
-			total += s.slots[i].count.Load()
-		}
-	}
-	return total
+	windowStart := time.Now().Unix() - int64(windowSeconds)
+	return p.counters.sum(entityID, eventType, windowStart)
 }
 
 func (w *worker) run(ctx context.Context, in <-chan types.Event, out chan<- types.Result) {
@@ -146,12 +117,6 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 	// Apply event-level timeout so total rule evaluation time is bounded.
 	eventCtx, cancel := context.WithTimeout(ctx, w.pool.eventTimeout)
 	defer cancel()
-
-	w.evtCount++
-	if w.evtCount >= 1000 {
-		w.evtCount = 0
-		w.gcCounters()
-	}
 
 	snap := w.pool.snapshot.Load()
 	if snap == nil {
@@ -212,6 +177,9 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 		if r := recover(); r != nil {
 			rr.Err = fmt.Errorf("rule %s panicked: %v", rule.RuleID, r)
 		}
+		if rr.Err != nil {
+			rr.ErrMsg = rr.Err.Error()
+		}
 	}()
 
 	ruleCtx, cancel := context.WithTimeout(ctx, w.pool.ruleTimeout)
@@ -235,8 +203,8 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 	if !cached {
 		globals, err := rule.Program.Init(thread, predeclared)
 		if err != nil {
-			if ruleCtx.Err() != nil {
-				rr.Err = fmt.Errorf("rule %s: %w", rule.RuleID, context.DeadlineExceeded)
+			if ctxErr := ruleCtx.Err(); ctxErr != nil {
+				rr.Err = fmt.Errorf("rule %s init: %w: %v", rule.RuleID, ctxErr, err)
 			} else {
 				rr.Err = fmt.Errorf("rule %s init: %w", rule.RuleID, err)
 			}
@@ -259,8 +227,10 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 
 	retVal, err := starlark.Call(thread, evalFn, starlark.Tuple{starlarkEvent}, nil)
 	if err != nil {
-		if ruleCtx.Err() != nil {
-			rr.Err = fmt.Errorf("rule %s: %w", rule.RuleID, context.DeadlineExceeded)
+		if ctxErr := ruleCtx.Err(); ctxErr != nil {
+			// Keep the real cause (cancellation vs deadline) and the
+			// underlying eval error rather than relabelling both.
+			rr.Err = fmt.Errorf("rule %s: %w: %v", rule.RuleID, ctxErr, err)
 		} else {
 			rr.Err = fmt.Errorf("rule %s: %w", rule.RuleID, err)
 		}
@@ -276,38 +246,4 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 	rr.Verdict = verdict
 	rr.Reason = reason
 	return
-}
-
-// gcCounters evicts series whose buckets have all aged out, bounding memory
-// when entity IDs have high cardinality.
-func (w *worker) gcCounters() {
-	cutoff := time.Now().Unix() - counterMaxWindowSeconds
-	w.counters.Range(func(k, v any) bool {
-		s := v.(*counterSeries)
-		for i := range s.slots {
-			if s.slots[i].bucket.Load() >= cutoff {
-				return true
-			}
-		}
-		w.counters.Delete(k)
-		return true
-	})
-}
-
-func (w *worker) counterIncrement(entityID, eventType string, unixNow int64) {
-	bucket := (unixNow / counterBucketSeconds) * counterBucketSeconds
-	key := counterKey{EntityID: entityID, EventType: eventType}
-	v, ok := w.counters.Load(key)
-	if !ok {
-		v, _ = w.counters.LoadOrStore(key, &counterSeries{})
-	}
-	s := v.(*counterSeries)
-	slot := &s.slots[(bucket/counterBucketSeconds)%counterSlots]
-	if slot.bucket.Load() != bucket {
-		// Reset count before publishing the new bucket so concurrent readers
-		// never attribute a stale count to the new bucket.
-		slot.count.Store(0)
-		slot.bucket.Store(bucket)
-	}
-	slot.count.Add(1)
 }

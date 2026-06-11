@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -177,6 +178,88 @@ func TestFinalFlush_OnChannelClose(t *testing.T) {
 	}
 	if n != 5 {
 		t.Errorf("row count: got %d, want 5", n)
+	}
+}
+
+// TestEmitInteresting_SkipsPlainApprovals: with the interesting-only policy,
+// plain approvals are counted but not persisted or webhooked, while blocks
+// and rule failures flow through unchanged.
+func TestEmitInteresting_SkipsPlainApprovals(t *testing.T) {
+	var webhookCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhookCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	w, dbPath := testDB(t, srv.URL)
+	w.SetEmitInteresting(true)
+
+	failedResult := makeResult("evt-failed", "post", types.VerdictApprove)
+	failedResult.FailedRules = []types.RuleResult{{RuleID: "r2", ErrMsg: "boom"}}
+
+	in := make(chan types.Result, 3)
+	in <- makeResult("evt-approve", "post", types.VerdictApprove)
+	in <- makeResult("evt-block", "post", types.VerdictBlock)
+	in <- failedResult
+	close(in)
+
+	if err := w.Run(context.Background(), in); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	db := openReadDB(t, dbPath)
+	var ids []string
+	rows, err := db.Query("SELECT event_id FROM results ORDER BY event_id")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) != 2 || ids[0] != "evt-block" || ids[1] != "evt-failed" {
+		t.Errorf("persisted rows = %v, want [evt-block evt-failed]", ids)
+	}
+	if n := webhookCalls.Load(); n != 2 {
+		t.Errorf("webhook calls = %d, want 2 (approval skipped)", n)
+	}
+
+	stats := w.Stats()
+	if stats["results_approve"] != 2 || stats["results_block"] != 1 ||
+		stats["results_skipped"] != 1 || stats["results_errored"] != 1 {
+		t.Errorf("stats = %v, want approve=2 block=1 skipped=1 errored=1", stats)
+	}
+}
+
+// TestFailedRules_ErrMsgSerialized: failure reasons must survive JSON
+// marshalling (a bare error marshals as "{}").
+func TestFailedRules_ErrMsgSerialized(t *testing.T) {
+	w, dbPath := testDB(t, "")
+
+	result := makeResult("evt-errmsg", "post", types.VerdictApprove)
+	result.FailedRules = []types.RuleResult{{RuleID: "r-fail", ErrMsg: "division by zero"}}
+
+	in := make(chan types.Result, 1)
+	in <- result
+	close(in)
+	if err := w.Run(context.Background(), in); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	db := openReadDB(t, dbPath)
+	var failedJSON string
+	if err := db.QueryRow(
+		"SELECT CAST(failed_rules AS VARCHAR) FROM results WHERE event_id = ?", "evt-errmsg",
+	).Scan(&failedJSON); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !strings.Contains(failedJSON, "division by zero") {
+		t.Errorf("failed_rules JSON = %s, want to contain the error message", failedJSON)
 	}
 }
 
