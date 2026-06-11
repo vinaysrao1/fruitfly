@@ -4,8 +4,12 @@ import "time"
 
 // Event represents an incoming event to be evaluated by the rules engine.
 type Event struct {
-	EventID    string
-	EventType  string
+	EventID   string
+	EventType string
+	// EntityID is the routing key: the configured routing field from the
+	// payload when present, otherwise the event ID. It decides which pod
+	// owns the event in cluster mode and which counter keys are affine.
+	EntityID   string
 	Timestamp  time.Time
 	Payload    map[string]any
 	RawJSON    []byte

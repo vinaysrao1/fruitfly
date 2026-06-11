@@ -22,6 +22,7 @@ type worker struct {
 	evalCache  map[string]starlark.Callable // ruleID -> cached evaluate fn
 	evalSnap   string                       // snapshot ID that populated the cache
 	udfs       starlark.StringDict          // worker-lifetime UDFs (built once)
+	curEntity  string                       // routing key of the event being processed
 }
 
 // Pool manages worker goroutines that evaluate rules against events.
@@ -31,8 +32,16 @@ type Pool struct {
 	eventTimeout time.Duration
 	ruleTimeout  time.Duration
 	counters     counterStore
-	workers      []*worker
+	// counterAffinity, when set (cluster mode), restricts counter() keys to
+	// the event's routing entity: any other key would scatter increments
+	// across pods' private stores and silently undercount.
+	counterAffinity bool
+	workers         []*worker
 }
+
+// SetCounterAffinity enables the cluster-mode counter key restriction.
+// Must be called before Run.
+func (p *Pool) SetCounterAffinity(on bool) { p.counterAffinity = on }
 
 // NewPool creates a worker pool. Does not start workers.
 func NewPool(
@@ -142,12 +151,19 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 
 	// Convert the event to Starlark once; passed into each rule to avoid repeated conversion.
 	starlarkEvent := eventToStarlark(event)
+	w.curEntity = event.EntityID
 
 	var triggered []types.RuleResult
 	var failed []types.RuleResult
 
-	for _, rule := range matchedRules {
-		rr := w.evalRule(eventCtx, rule, starlarkEvent, w.udfs)
+	for i := range matchedRules {
+		rule := &matchedRules[i]
+		// Tier 1: native prefilter — no Starlark unless every clause passes.
+		if !rule.PrefilterMatch(&event) {
+			rule.Prefiltered.Add(1)
+			continue
+		}
+		rr := w.evalRule(eventCtx, *rule, starlarkEvent, w.udfs)
 		if rr.Err != nil {
 			failed = append(failed, rr)
 		} else if rr.Verdict != "" {
@@ -210,6 +226,9 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 			}
 			return
 		}
+		// Freeze module globals: mutating module-level state is an error,
+		// not nondeterministic per-worker state.
+		globals.Freeze()
 
 		fn, ok := globals["evaluate"]
 		if !ok {

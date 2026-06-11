@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,6 +21,12 @@ type Rule struct {
 	EventType string // "*" matches all
 	Priority  int
 	Program   *starlark.Program
+	// Match holds the lowered tier-1 prefilter clauses (nil = always run).
+	Match []Predicate
+	// Prefiltered counts events skipped by the prefilter; a pointer so all
+	// copies of this Rule share one counter, surfaced via /admin/rules so
+	// an over-aggressive match block is visible rather than silent.
+	Prefiltered *atomic.Int64
 }
 
 // Snapshot is an immutable collection of compiled rules, sorted by priority desc.
@@ -111,24 +120,40 @@ func (c *Compiler) CompileDir(dir string) (*Snapshot, error) {
 		return nil, fmt.Errorf("glob %s: %w", pattern, err)
 	}
 
-	rules := make([]Rule, 0, len(files))
-	seen := make(map[string]string) // rule_id -> filename
-
-	for _, path := range files {
-		src, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", path, err)
-		}
-
-		rule, err := c.CompileSource(filepath.Base(path), string(src))
+	// Compile files in parallel (compilation is pure); report the first
+	// error in deterministic (sorted-glob) order.
+	compiled := make([]*Rule, len(files))
+	errs := make([]error, len(files))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
+	for i, path := range files {
+		wg.Add(1)
+		go func(i int, path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			src, err := os.ReadFile(path)
+			if err != nil {
+				errs[i] = fmt.Errorf("read %s: %w", path, err)
+				return
+			}
+			compiled[i], errs[i] = c.CompileSource(filepath.Base(path), string(src))
+		}(i, path)
+	}
+	wg.Wait()
+	for _, err := range errs {
 		if err != nil {
 			return nil, err
 		}
+	}
 
+	rules := make([]Rule, 0, len(files))
+	seen := make(map[string]string) // rule_id -> filename
+	for i, rule := range compiled {
 		if prev, dup := seen[rule.RuleID]; dup {
-			return nil, fmt.Errorf("duplicate rule_id %q in %s and %s", rule.RuleID, prev, filepath.Base(path))
+			return nil, fmt.Errorf("duplicate rule_id %q in %s and %s", rule.RuleID, prev, filepath.Base(files[i]))
 		}
-		seen[rule.RuleID] = filepath.Base(path)
+		seen[rule.RuleID] = filepath.Base(files[i])
 		rules = append(rules, *rule)
 	}
 
@@ -198,11 +223,22 @@ func (c *Compiler) CompileSource(filename, source string) (*Rule, error) {
 		return nil, fmt.Errorf("%s: 'evaluate' must be callable, got %s", filename, evalVal.Type())
 	}
 
+	// Optional tier-1 prefilter.
+	var match []Predicate
+	if matchVal, ok := globals["match"]; ok {
+		match, err = lowerMatch(filename, matchVal)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &Rule{
-		RuleID:    ruleID,
-		EventType: eventType,
-		Priority:  priority,
-		Program:   prog,
+		RuleID:      ruleID,
+		EventType:   eventType,
+		Priority:    priority,
+		Program:     prog,
+		Match:       match,
+		Prefiltered: &atomic.Int64{},
 	}, nil
 }
 

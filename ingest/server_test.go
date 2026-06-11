@@ -277,3 +277,92 @@ func TestEventID_256CharBoundary(t *testing.T) {
 		t.Error("expected empty channel after 257-char event_id rejection")
 	}
 }
+
+func postBatch(srv *Server, body string, forwarded bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/events/batch", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if forwarded {
+		req.Header.Set("X-Fruitfly-Forwarded", "1")
+	}
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	return rr
+}
+
+func TestBatch_AcceptsNDJSON(t *testing.T) {
+	srv, ch := makeServer(10, 1024*1024)
+
+	body := validBody("b-1") + "\n" + validBody("b-2") + "\n\n" + validBody("b-3") + "\n"
+	rr := postBatch(srv, body, false)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"accepted":3`) {
+		t.Errorf("body = %s, want accepted:3", rr.Body.String())
+	}
+	if len(ch) != 3 {
+		t.Errorf("enqueued = %d, want 3", len(ch))
+	}
+}
+
+func TestBatch_RejectsInvalidLinesIndividually(t *testing.T) {
+	srv, ch := makeServer(10, 1024*1024)
+
+	body := validBody("ok-1") + "\n" + `{"event_type": ""}` + "\n" + "not json" + "\n" + validBody("ok-2")
+	rr := postBatch(srv, body, false)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"accepted":2`) || !strings.Contains(rr.Body.String(), `"rejected":2`) {
+		t.Errorf("body = %s, want accepted:2 rejected:2", rr.Body.String())
+	}
+	if len(ch) != 2 {
+		t.Errorf("enqueued = %d, want 2", len(ch))
+	}
+}
+
+func TestBatch_BackpressureReturns429WithCounts(t *testing.T) {
+	srv, ch := makeServer(1, 1024*1024)
+
+	body := validBody("p-1") + "\n" + validBody("p-2") + "\n" + validBody("p-3")
+	rr := postBatch(srv, body, false)
+
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), `"accepted":1`) || !strings.Contains(rr.Body.String(), `"rejected":2`) {
+		t.Errorf("body = %s, want accepted:1 rejected:2", rr.Body.String())
+	}
+	if len(ch) != 1 {
+		t.Errorf("enqueued = %d, want 1", len(ch))
+	}
+}
+
+func TestEntityID_FromRoutingField(t *testing.T) {
+	srv, ch := makeServer(2, 1024*1024)
+
+	post(srv, `{"event_type": "post", "timestamp": "2024-01-15T10:30:00Z", "entity_id": "user-42"}`)
+	withEntity := <-ch
+	if withEntity.EntityID != "user-42" {
+		t.Errorf("EntityID = %q, want user-42", withEntity.EntityID)
+	}
+
+	post(srv, `{"event_id": "evt-9", "event_type": "post", "timestamp": "2024-01-15T10:30:00Z"}`)
+	withoutEntity := <-ch
+	if withoutEntity.EntityID != "evt-9" {
+		t.Errorf("EntityID = %q, want fallback to event_id evt-9", withoutEntity.EntityID)
+	}
+}
+
+func TestEntityID_CustomRoutingField(t *testing.T) {
+	srv, ch := makeServer(1, 1024*1024)
+	srv.SetRoutingField("user_id")
+
+	post(srv, `{"event_type": "post", "timestamp": "2024-01-15T10:30:00Z", "user_id": "u-7", "entity_id": "ignored"}`)
+	event := <-ch
+	if event.EntityID != "u-7" {
+		t.Errorf("EntityID = %q, want u-7 (custom routing field)", event.EntityID)
+	}
+}

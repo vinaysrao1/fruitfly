@@ -887,6 +887,143 @@ func TestCounterSeries_WindowFiltering(t *testing.T) {
 	}
 }
 
+// TestPrefilter_SkipsRuleWithoutError: a tier-1 prefiltered rule is skipped
+// silently — not triggered, not failed — and its prefiltered counter ticks.
+func TestPrefilter_SkipsRuleWithoutError(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "short-post"
+event_type = "post"
+priority = 100
+match = {"all": [["payload.char_count", "<", 20]]}
+def evaluate(event):
+    return verdict("block", reason="short post")
+`)
+	pool, _ := makePool(snap, 1)
+
+	// char_count >= 20: prefilter rejects, rule never runs.
+	long := runSingleEvent(t, pool, testEvent("post", map[string]any{"char_count": float64(100)}))
+	if long.FinalVerdict != types.VerdictApprove {
+		t.Errorf("long post: verdict = %q, want approve (rule prefiltered)", long.FinalVerdict)
+	}
+	if len(long.TriggeredRules) != 0 || len(long.FailedRules) != 0 {
+		t.Errorf("long post: triggered=%d failed=%d, want 0/0", len(long.TriggeredRules), len(long.FailedRules))
+	}
+	if got := snap.Rules[0].Prefiltered.Load(); got != 1 {
+		t.Errorf("Prefiltered = %d, want 1", got)
+	}
+
+	// char_count < 20: prefilter passes, rule blocks.
+	short := runSingleEvent(t, pool, testEvent("post", map[string]any{"char_count": float64(5)}))
+	if short.FinalVerdict != types.VerdictBlock {
+		t.Errorf("short post: verdict = %q, want block", short.FinalVerdict)
+	}
+	if got := snap.Rules[0].Prefiltered.Load(); got != 1 {
+		t.Errorf("Prefiltered after passing event = %d, want still 1", got)
+	}
+}
+
+// TestCounterAffinity_ClusterMode: with counter affinity enabled, counter()
+// accepts the event's routing entity and rejects any other key (which would
+// silently undercount across pods).
+func TestCounterAffinity_ClusterMode(t *testing.T) {
+	snap := compileRules(t, []struct{ filename, source string }{
+		{"affine.star", `
+rule_id = "affine"
+event_type = "post"
+priority = 200
+def evaluate(event):
+    counter(event["payload"]["entity_id"], "post", 60)
+    return verdict("approve", reason="affine-ok")
+`},
+		{"nonaffine.star", `
+rule_id = "non-affine"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    counter("someone-else", "post", 60)
+    return verdict("approve")
+`},
+	})
+
+	var ptr atomic.Pointer[rules.Snapshot]
+	ptr.Store(snap)
+	pool := NewPool(1, &ptr, 5*time.Second, time.Second)
+	pool.SetCounterAffinity(true)
+
+	event := testEvent("post", map[string]any{"entity_id": "user-7"})
+	event.EntityID = "user-7"
+	result := runSingleEvent(t, pool, event)
+
+	if len(result.TriggeredRules) != 1 || result.TriggeredRules[0].RuleID != "affine" {
+		t.Errorf("triggered = %v, want only the affine rule", result.TriggeredRules)
+	}
+	if len(result.FailedRules) != 1 || result.FailedRules[0].RuleID != "non-affine" {
+		t.Fatalf("failed = %v, want only the non-affine rule", result.FailedRules)
+	}
+	if !strings.Contains(result.FailedRules[0].Err.Error(), "affine") {
+		t.Errorf("error = %v, want affinity explanation", result.FailedRules[0].Err)
+	}
+}
+
+// TestLazyEvent_DictSurface: the lazy event view supports the dict
+// operations rules use — indexing, get with default, membership, iteration
+// (sorted), len — and rejects mutation with a "frozen" error.
+func TestLazyEvent_DictSurface(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "surface"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    p = event["payload"]
+    checks = [
+        p.get("text", "none") == "hello",
+        p.get("missing", "dflt") == "dflt",
+        "text" in p,
+        "missing" not in p,
+        len(event) == 4,
+        sorted([k for k in p]) == p.keys(),
+        p["nested"]["deep"] == 1,
+    ]
+    if all(checks):
+        return verdict("block", reason="all-passed")
+    return verdict("review", reason=str(checks))
+`)
+	pool, _ := makePool(snap, 1)
+	result := runSingleEvent(t, pool, testEvent("post", map[string]any{
+		"text":   "hello",
+		"nested": map[string]any{"deep": float64(1)},
+	}))
+
+	if result.FinalVerdict != types.VerdictBlock {
+		reason := ""
+		if len(result.FailedRules) > 0 {
+			reason = result.FailedRules[0].ErrMsg
+		} else if len(result.TriggeredRules) > 0 {
+			reason = result.TriggeredRules[0].Reason
+		}
+		t.Errorf("verdict = %q, want block; detail: %s", result.FinalVerdict, reason)
+	}
+}
+
+// TestLazyEvent_ListsAreFrozen: composite payload values converted by the
+// lazy view are frozen, so list mutation is a rule error.
+func TestLazyEvent_ListsAreFrozen(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "list-mutator"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    event["payload"]["tags"].append("x")
+    return verdict("approve")
+`)
+	pool, _ := makePool(snap, 1)
+	result := runSingleEvent(t, pool, testEvent("post", map[string]any{"tags": []any{"a"}}))
+
+	if len(result.FailedRules) != 1 || !strings.Contains(result.FailedRules[0].Err.Error(), "frozen") {
+		t.Errorf("FailedRules = %v, want one frozen-mutation error", result.FailedRules)
+	}
+}
+
 // --- T30: Nil snapshot -> default approve ---
 
 // T30: When snapshot pointer is nil, event should return default approve verdict.

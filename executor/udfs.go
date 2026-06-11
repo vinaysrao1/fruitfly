@@ -82,6 +82,13 @@ func counterUDF(w *worker) func(*starlark.Thread, *starlark.Builtin, starlark.Tu
 			// one failure mode a rate-limiting primitive must not have.
 			return nil, fmt.Errorf("counter: window_seconds must be <= %d", counterMaxWindowSeconds)
 		}
+		if w.pool.counterAffinity && entityID != w.curEntity {
+			// Cluster mode: a key other than the routing entity would
+			// scatter increments across pods' private stores and silently
+			// undercount. Count by another perspective via producer-side
+			// event fan-out (docs/SCALING_10M.md §6).
+			return nil, fmt.Errorf("counter: key %q is not affine to routing entity %q (cluster mode requires affine counter keys)", entityID, w.curEntity)
+		}
 		now := time.Now().Unix()
 		w.pool.counters.increment(entityID, eventType, now)
 		total := w.pool.CounterSum(entityID, eventType, windowSeconds)
