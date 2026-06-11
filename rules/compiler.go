@@ -128,9 +128,9 @@ func (c *Compiler) CompileDir(dir string) (*Snapshot, error) {
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
 	for i, path := range files {
 		wg.Add(1)
+		sem <- struct{}{} // bound in-flight goroutines, not just running ones
 		go func(i int, path string) {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			src, err := os.ReadFile(path)
 			if err != nil {

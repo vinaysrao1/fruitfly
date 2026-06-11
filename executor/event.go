@@ -40,11 +40,15 @@ var (
 	_ starlark.HasAttrs        = (*lazyDict)(nil)
 )
 
-func (d *lazyDict) Type() string          { return "dict" }
+// Type is "event", not "dict": claiming "dict" would route == comparisons
+// into (*starlark.Dict).CompareSameType, which panics on a non-Dict operand
+// one way and silently compares identity the other. With a distinct type,
+// comparing the view to a dict literal is a clean, symmetric False.
+func (d *lazyDict) Type() string          { return "event" }
 func (d *lazyDict) Freeze()               {} // born frozen
 func (d *lazyDict) Truth() starlark.Bool  { return len(d.src) > 0 }
 func (d *lazyDict) Len() int              { return len(d.src) }
-func (d *lazyDict) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable type: dict") }
+func (d *lazyDict) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable type: event") }
 
 func (d *lazyDict) String() string {
 	return fmt.Sprintf("<event dict, %d keys>", len(d.src))

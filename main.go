@@ -107,8 +107,10 @@ func main() {
 	// Build HTTP mux.
 	mux := http.NewServeMux()
 
-	// Mount ingest handler - it already has POST /events registered.
+	// Mount ingest routes. Go 1.22 ServeMux patterns are exact-match, so
+	// "/events" alone would 404 "/events/batch"; register the subtree too.
 	mux.Handle("/events", ingestServer.Handler())
+	mux.Handle("/events/", ingestServer.Handler())
 
 	// Admin: liveness check (always 200).
 	mux.HandleFunc("GET /admin/health", func(w http.ResponseWriter, r *http.Request) {

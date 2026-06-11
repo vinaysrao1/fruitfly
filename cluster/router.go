@@ -12,11 +12,27 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
 const forwardTimeout = 5 * time.Second
+
+// StatusError reports that the peer received the request and answered with
+// a non-success status. Callers must NOT replay the payload locally: the
+// peer may have processed part of it (e.g. the accepted prefix of a batch
+// before backpressure), so replaying would duplicate events. Only transport
+// errors — where the peer never received the bytes — are safe to retry.
+type StatusError struct {
+	Peer string
+	Code int
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("peer %s returned %d", e.Peer, e.Code)
+}
 
 // Router forwards events to the peer that owns their routing key.
 type Router struct {
@@ -27,25 +43,32 @@ type Router struct {
 
 // NewRouter builds a router from the static peer list. self must be one of
 // peers (it identifies this process); peers must contain at least one entry.
+// URLs are normalized (trailing slashes stripped) so cosmetic differences
+// cannot split one pod into two ring entries.
 func NewRouter(self string, peers []string) (*Router, error) {
 	if len(peers) == 0 {
 		return nil, fmt.Errorf("cluster: peer list is empty")
 	}
+	self = strings.TrimRight(self, "/")
+	normalized := make([]string, len(peers))
 	found := false
-	for _, p := range peers {
-		if p == self {
+	for i, p := range peers {
+		normalized[i] = strings.TrimRight(p, "/")
+		if normalized[i] == self {
 			found = true
-			break
 		}
 	}
 	if !found {
 		return nil, fmt.Errorf("cluster: self %q not in peer list %v", self, peers)
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 32 // forwarding is (N-1)/N of traffic; reuse connections
 	return &Router{
 		self:  self,
-		peers: peers,
+		peers: normalized,
 		client: &http.Client{
-			Timeout: forwardTimeout,
+			Timeout:   forwardTimeout,
+			Transport: transport,
 		},
 	}, nil
 }
@@ -103,9 +126,11 @@ func (r *Router) Forward(ctx context.Context, peer string, body []byte, batch bo
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	// Drain so the connection is reusable by keep-alive.
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("peer %s returned %d", peer, resp.StatusCode)
+		return &StatusError{Peer: peer, Code: resp.StatusCode}
 	}
 	return nil
 }

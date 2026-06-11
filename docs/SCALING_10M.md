@@ -68,7 +68,7 @@ the rules engine matters.
 **Transport: batches first, streams second, single events forever.**
 
 - `POST /events` — unchanged (compatibility, debugging, low-rate users).
-- `POST /events/batch` — NDJSON or a JSON array; one request carries
+- `POST /events/batch` — NDJSON (one event per line); one request carries
   thousands of events. This alone removes HTTP framing as the bottleneck and
   is the only transport change most users ever need.
 - `GET /events/stream` (upgrade) or gRPC client-stream — for sustained
@@ -163,8 +163,9 @@ Starlark and no allocation. Supported ops stay deliberately tiny: `==`, `!=`,
 
 The lowering semantics are fixed, not implementation-defined:
 
-- `match` must be a static dict literal; computing it dynamically is a
-  compile error.
+- `match` is lowered from the module global's value after initialization;
+  whatever dict the module produces is validated and lowered at compile
+  time (a non-dict or malformed shape is a compile error).
 - A missing or type-mismatched field makes that clause **false** — the rule
   is skipped, never errored. (`exists` is the explicit way to test
   presence.)
@@ -183,17 +184,14 @@ authors control the surviving set.
 
 - `CompileDir` compiles files across `GOMAXPROCS` goroutines (compilation is
   pure). 10k rules compile in roughly the time 10k/N took before.
-- The snapshot pre-runs `Program.Init` once per rule at compile time and
-  stores the extracted `evaluate` callables **with their globals frozen** —
-  starlark-go freezes only via `ExecFile`, not `Program.Init`, so the
-  snapshot must call `Freeze()` explicitly. Freezing is what makes one
-  shared snapshot safe across 64 workers, and it deliberately tightens the
-  contract: mutating module-level state becomes a runtime error instead of
-  today's silent per-worker mutable globals (whose value depends on which
-  worker an event happens to land on — nondeterminism not worth
-  preserving). With that, a snapshot swap costs workers nothing; today each
-  worker re-inits every rule on first use after a swap, a visible warmup
-  spike at 10k rules × 64 workers.
+- Module globals are frozen after `Program.Init` (starlark-go freezes only
+  via `ExecFile`), deliberately tightening the contract: mutating
+  module-level state is a runtime error instead of silent per-worker
+  mutable globals (whose value would depend on which worker an event
+  happens to land on). *Future work:* pre-run `Init` once per rule at
+  compile time and share the frozen `evaluate` callables across workers,
+  eliminating the per-worker re-init warmup after a snapshot swap (now
+  rare, since unchanged content no longer republishes).
 - The reloader stops recompiling on a timer: poll ticks hash the rules
   directory contents and skip publication when nothing changed, so snapshot
   IDs change only when rules do. (Today every 10-second poll mints a new

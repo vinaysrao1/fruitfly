@@ -140,12 +140,19 @@ func (s *Server) enqueue(event types.Event) bool {
 	}
 }
 
+// peerStatus extracts the HTTP status from a Forward error when the peer
+// actually responded (as opposed to a transport failure).
+func peerStatus(err error) (int, bool) {
+	var se interface{ StatusCode() int }
+	if errors.As(err, &se) {
+		return se.StatusCode(), true
+	}
+	return 0, false
+}
+
 // handleEvent handles POST /events.
 func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
-	ct := r.Header.Get("Content-Type")
-	if ct != "" && !strings.HasPrefix(ct, "application/json") {
-		slog.Warn("invalid event: unsupported content type", "content_type", ct)
-		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+	if !contentTypeOK(w, r) {
 		return
 	}
 
@@ -174,13 +181,26 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	// forwarded once (one-hop bound).
 	if s.router != nil && r.Header.Get(forwardedHeader) == "" {
 		if peer, self := s.router.Owner(event.EntityID); !self {
-			if err := s.router.Forward(r.Context(), peer, raw, false); err == nil {
+			err := s.router.Forward(r.Context(), peer, raw, false)
+			if err == nil {
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
-			// Peer unreachable: process locally rather than drop. Counters
-			// for this key are briefly approximate — the same class of
-			// degradation as a ring change.
+			if code, ok := peerStatus(err); ok {
+				// The peer received the event and refused it; its answer is
+				// authoritative. Propagate backpressure instead of breaking
+				// affinity by processing locally.
+				status := http.StatusBadGateway
+				if code == http.StatusTooManyRequests {
+					status = http.StatusTooManyRequests
+				}
+				slog.Warn("owning peer rejected event", "peer", peer, "status", code)
+				http.Error(w, fmt.Sprintf("owning peer rejected event (%d)", code), status)
+				return
+			}
+			// Transport failure: the peer never received the bytes, so local
+			// processing cannot duplicate. Counters for this key are briefly
+			// approximate — the same class of degradation as a ring change.
 			slog.Warn("forward failed, processing locally", "peer", peer, "error", err)
 		}
 	}
@@ -193,6 +213,16 @@ func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+func contentTypeOK(w http.ResponseWriter, r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if ct != "" && !strings.HasPrefix(ct, "application/json") {
+		slog.Warn("invalid event: unsupported content type", "content_type", ct)
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+		return false
+	}
+	return true
+}
+
 // batchResponse reports per-batch outcomes for POST /events/batch.
 type batchResponse struct {
 	Accepted  int `json:"accepted"`
@@ -200,75 +230,79 @@ type batchResponse struct {
 	Rejected  int `json:"rejected"`
 }
 
+// remoteGroup collects a peer's share of a batch: raw lines for forwarding
+// plus their already-parsed events for transport-failure fallback.
+type remoteGroup struct {
+	raws   [][]byte
+	events []types.Event
+}
+
 // handleBatch handles POST /events/batch: NDJSON, one event per line.
-// Invalid lines are rejected individually; valid lines are enqueued (or, in
-// cluster mode, forwarded to their owning peer grouped per peer). On
-// backpressure the remainder of the batch is rejected and 429 is returned
-// with the counts so far.
+// Per-line contract: invalid or oversized lines are rejected individually
+// and never abort the batch. Valid lines are enqueued or, in cluster mode,
+// forwarded to their owning peer grouped per peer. On backpressure the
+// remainder is rejected and 429 is returned with the counts. Retrying a
+// partially-accepted batch is safe only when events carry client event IDs
+// (downstream persistence dedupes on event_id).
 func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
+	if !contentTypeOK(w, r) {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
 
 	var resp batchResponse
 	overloaded := false
+	readStatus := 0
 
-	// Lines owned by remote peers, grouped per peer for one request each.
-	remote := make(map[string][][]byte)
+	remote := make(map[string]*remoteGroup)
 	forwarded := r.Header.Get(forwardedHeader) != ""
 
-	scanner := bufio.NewScanner(r.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), s.maxBytes)
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
+	reader := bufio.NewReaderSize(r.Body, 64*1024)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err == nil || err == io.EOF {
+			s.batchLine(bytes.TrimSpace(line), forwarded, &resp, &overloaded, remote)
 		}
-		if overloaded {
-			resp.Rejected++
-			continue
+		if err == io.EOF {
+			break
 		}
-		// Scanner reuses its buffer; events keep their raw bytes.
-		raw := bytes.Clone(line)
-
-		event, err := s.parseEvent(raw)
 		if err != nil {
-			resp.Rejected++
-			continue
-		}
-
-		if s.router != nil && !forwarded {
-			if peer, self := s.router.Owner(event.EntityID); !self {
-				remote[peer] = append(remote[peer], raw)
-				continue
+			// A partial line was discarded; everything before it is already
+			// accounted for. Report what happened with the counts so far.
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				readStatus = http.StatusRequestEntityTooLarge
+			} else {
+				readStatus = http.StatusBadRequest
 			}
-		}
-
-		if s.enqueue(event) {
-			resp.Accepted++
-		} else {
-			resp.Rejected++
-			overloaded = true
+			break
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
-		return
-	}
 
-	// Forward remote groups, one NDJSON request per peer. On failure, fall
-	// back to local processing (degraded counters beat dropped events).
-	for peer, lines := range remote {
-		body := bytes.Join(lines, []byte("\n"))
-		if err := s.router.Forward(r.Context(), peer, body, true); err == nil {
-			resp.Forwarded += len(lines)
+	// Forward remote groups, one NDJSON request per peer.
+	for peer, group := range remote {
+		body := bytes.Join(group.raws, []byte("\n"))
+		err := s.router.Forward(r.Context(), peer, body, true)
+		if err == nil {
+			resp.Forwarded += len(group.raws)
 			continue
 		}
-		slog.Warn("batch forward failed, processing locally", "peer", peer, "lines", len(lines))
-		for _, raw := range lines {
-			event, err := s.parseEvent(raw)
-			if err != nil {
-				resp.Rejected++
-				continue
+		if code, ok := peerStatus(err); ok {
+			// The peer received the sub-batch and may have processed part
+			// of it before answering (e.g. its accepted prefix under
+			// backpressure). Replaying locally would duplicate events, so
+			// count the sub-batch rejected and surface backpressure.
+			slog.Warn("peer rejected forwarded batch", "peer", peer, "status", code, "lines", len(group.raws))
+			resp.Rejected += len(group.raws)
+			if code == http.StatusTooManyRequests {
+				overloaded = true
 			}
+			continue
+		}
+		// Transport failure: the peer never received the bytes; process
+		// locally rather than drop (degraded counters beat lost events).
+		slog.Warn("batch forward failed, processing locally", "peer", peer, "lines", len(group.raws))
+		for _, event := range group.events {
 			if s.enqueue(event) {
 				resp.Accepted++
 			} else {
@@ -279,10 +313,58 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := http.StatusAccepted
-	if overloaded {
+	switch {
+	case readStatus != 0:
+		status = readStatus
+	case overloaded:
 		status = http.StatusTooManyRequests
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(resp)
+}
+
+// batchLine handles one NDJSON line: validate, then enqueue locally or
+// stage for forwarding to the owning peer.
+func (s *Server) batchLine(line []byte, forwarded bool, resp *batchResponse, overloaded *bool, remote map[string]*remoteGroup) {
+	if len(line) == 0 {
+		return
+	}
+	if len(line) > s.maxBytes {
+		resp.Rejected++ // oversized line: reject it alone, not the batch
+		return
+	}
+	if *overloaded {
+		resp.Rejected++
+		return
+	}
+	// ReadBytes allocates per line, but defensively clone: events keep
+	// their raw bytes for the lifetime of the pipeline.
+	raw := bytes.Clone(line)
+
+	event, err := s.parseEvent(raw)
+	if err != nil {
+		resp.Rejected++
+		return
+	}
+
+	if s.router != nil && !forwarded {
+		if peer, self := s.router.Owner(event.EntityID); !self {
+			g := remote[peer]
+			if g == nil {
+				g = &remoteGroup{}
+				remote[peer] = g
+			}
+			g.raws = append(g.raws, raw)
+			g.events = append(g.events, event)
+			return
+		}
+	}
+
+	if s.enqueue(event) {
+		resp.Accepted++
+	} else {
+		resp.Rejected++
+		*overloaded = true
+	}
 }

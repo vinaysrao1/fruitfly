@@ -1005,6 +1005,61 @@ def evaluate(event):
 	}
 }
 
+// TestLazyEvent_DictEqualityIsSafe (review H3): comparing the lazy view to
+// a real dict must not panic in either direction. The view has its own
+// Starlark type, so the comparison is a clean, symmetric False.
+func TestLazyEvent_DictEqualityIsSafe(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "eq-safety"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    p = event["payload"]
+    lhs = ({"text": "hi"} == p)
+    rhs = (p == {"text": "hi"})
+    if lhs or rhs:
+        return verdict("review", reason="unexpected equality")
+    return verdict("block", reason="comparisons completed")
+`)
+	pool, _ := makePool(snap, 1)
+	result := runSingleEvent(t, pool, testEvent("post", map[string]any{"text": "hi"}))
+
+	if len(result.FailedRules) != 0 {
+		t.Fatalf("rule failed (panic?): %v", result.FailedRules[0].ErrMsg)
+	}
+	if result.FinalVerdict != types.VerdictBlock {
+		t.Errorf("verdict = %q, want block (both comparisons False, no panic)", result.FinalVerdict)
+	}
+}
+
+// TestCounterAffinity_PrefixScopedKeys: "<entity>:<scope>" keys are affine
+// (they live on the entity's home pod), per docs/SCALING_10M.md §6.
+func TestCounterAffinity_PrefixScopedKeys(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "scoped"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    counter(event["payload"]["entity_id"] + ":likes", "post", 60)
+    return verdict("approve", reason="scoped-ok")
+`)
+	var ptr atomic.Pointer[rules.Snapshot]
+	ptr.Store(snap)
+	pool := NewPool(1, &ptr, 5*time.Second, time.Second)
+	pool.SetCounterAffinity(true)
+
+	event := testEvent("post", map[string]any{"entity_id": "user-9"})
+	event.EntityID = "user-9"
+	result := runSingleEvent(t, pool, event)
+
+	if len(result.FailedRules) != 0 {
+		t.Fatalf("scoped key rejected: %v", result.FailedRules[0].ErrMsg)
+	}
+	if len(result.TriggeredRules) != 1 || result.TriggeredRules[0].Reason != "scoped-ok" {
+		t.Errorf("triggered = %v, want scoped-ok", result.TriggeredRules)
+	}
+}
+
 // TestLazyEvent_ListsAreFrozen: composite payload values converted by the
 // lazy view are frozen, so list mutation is a rule error.
 func TestLazyEvent_ListsAreFrozen(t *testing.T) {
