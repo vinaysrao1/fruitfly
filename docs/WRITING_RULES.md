@@ -164,5 +164,7 @@ Remove or rename the `.star` file (e.g., `mv rules/spam.star rules/spam.star.dis
 - Keep rules simple. Each rule should check one thing.
 - Use `priority` to layer rules: high-priority blockers, mid-priority reviewers, low-priority approvers.
 - Use `memo()` if multiple rules compute the same value from the payload.
-- Counter windows max out at 1 hour. Data older than 1 hour is garbage collected.
+- Counter windows max out at 1 hour (3600 seconds): `counter()` returns an error
+  for larger windows rather than a silently truncated count, and the rule lands
+  in `failed_rules`. Data older than 1 hour is garbage collected.
 - Rules run in a sandbox — no file I/O, no network, no imports. Only the built-in functions above are available.

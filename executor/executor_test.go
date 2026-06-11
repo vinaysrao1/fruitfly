@@ -874,11 +874,13 @@ func TestCounterSeries_WindowFiltering(t *testing.T) {
 	pool.counters.increment("user", "post", now)
 	pool.counters.increment("user", "post", now-120) // two buckets back
 
-	if got := pool.CounterSum("user", "post", 60); got != 1 {
-		t.Errorf("CounterSum(60s) = %d, want 1 (older bucket outside window)", got)
+	// Use explicit window starts: CounterSum derives the window from
+	// time.Now(), which would race the minute boundary in a test.
+	if got := pool.counters.sum("user", "post", now-59); got != 1 {
+		t.Errorf("sum(59s window) = %d, want 1 (older bucket outside window)", got)
 	}
-	if got := pool.CounterSum("user", "post", 3600); got != 2 {
-		t.Errorf("CounterSum(3600s) = %d, want 2", got)
+	if got := pool.counters.sum("user", "post", now-3600); got != 2 {
+		t.Errorf("sum(3600s window) = %d, want 2", got)
 	}
 	if got := pool.CounterSum("other", "post", 3600); got != 0 {
 		t.Errorf("CounterSum(unknown key) = %d, want 0", got)

@@ -225,6 +225,13 @@ func TestEmitInteresting_SkipsPlainApprovals(t *testing.T) {
 	if len(ids) != 2 || ids[0] != "evt-block" || ids[1] != "evt-failed" {
 		t.Errorf("persisted rows = %v, want [evt-block evt-failed]", ids)
 	}
+	// Webhooks fire in unawaited goroutines; poll for the expected count,
+	// then give a stray third call a moment to show up.
+	deadline := time.Now().Add(3 * time.Second)
+	for webhookCalls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
 	if n := webhookCalls.Load(); n != 2 {
 		t.Errorf("webhook calls = %d, want 2 (approval skipped)", n)
 	}

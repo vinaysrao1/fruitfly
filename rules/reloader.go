@@ -35,6 +35,12 @@ type Reloader struct {
 func NewReloader(compiler *Compiler, rulesDir string,
 	snapshot *atomic.Pointer[Snapshot]) (*Reloader, error) {
 
+	// Hash before compiling (same order as doReload): if a file changes in
+	// between, the stored hash is stale and the next reload recompiles. The
+	// reverse order could record a hash for content that was never
+	// compiled, permanently masking that change.
+	hash, hashErr := hashDir(rulesDir)
+
 	snap, err := compiler.CompileDir(rulesDir)
 	if err != nil {
 		return nil, err
@@ -47,8 +53,8 @@ func NewReloader(compiler *Compiler, rulesDir string,
 		snapshot: snapshot,
 		reloadCh: make(chan struct{}, 1),
 	}
-	if h, err := hashDir(rulesDir); err == nil {
-		r.lastHash = h
+	if hashErr == nil {
+		r.lastHash = hash
 	}
 	r.Ready.Store(true)
 
@@ -131,7 +137,9 @@ func (r *Reloader) Run(ctx context.Context) error {
 	}
 }
 
-// Reload signals an immediate recompilation. Non-blocking, fire-and-forget.
+// Reload signals an immediate reload check. Non-blocking, fire-and-forget.
+// A reload only publishes a new snapshot when rule content has changed;
+// unchanged content is a no-op so worker eval caches stay warm.
 func (r *Reloader) Reload() {
 	select {
 	case r.reloadCh <- struct{}{}:
