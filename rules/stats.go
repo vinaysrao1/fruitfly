@@ -3,6 +3,7 @@ package rules
 import (
 	"log/slog"
 	"math"
+	"slices"
 	"sync/atomic"
 	"time"
 )
@@ -97,11 +98,6 @@ func SlowRuleThreshold(rs []Rule) time.Duration {
 	if len(ewmas) < 2 {
 		return 0
 	}
-	// Median by partial sort (rule counts are small even at 10k).
-	for i := 1; i < len(ewmas); i++ {
-		for j := i; j > 0 && ewmas[j] < ewmas[j-1]; j-- {
-			ewmas[j], ewmas[j-1] = ewmas[j-1], ewmas[j]
-		}
-	}
+	slices.Sort(ewmas)
 	return ewmas[len(ewmas)/2] * slowFactor
 }
