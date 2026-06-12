@@ -1355,3 +1355,65 @@ def evaluate(event):
 		t.Errorf("CounterSum = %d, want %d (exact under concurrency)", got, events)
 	}
 }
+
+// TestRuleStats_RecordedPerEvaluation: stats accumulate for evaluated rules
+// and distinguish slow rules from fast peers; prefiltered rules observe
+// nothing (they never run).
+func TestRuleStats_RecordedPerEvaluation(t *testing.T) {
+	snap := compileRules(t, []struct{ filename, source string }{
+		{"slowish.star", `
+rule_id = "slowish"
+event_type = "post"
+priority = 200
+def evaluate(event):
+    x = 0
+    for i in range(20000):
+        x += 1
+    return verdict("approve")
+`},
+		{"fast.star", `
+rule_id = "fast"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    return verdict("approve")
+`},
+		{"filtered.star", `
+rule_id = "filtered"
+event_type = "post"
+priority = 50
+match = {"all": [["payload.never", "exists"]]}
+def evaluate(event):
+    return verdict("approve")
+`},
+	})
+	var ptr atomic.Pointer[rules.Snapshot]
+	ptr.Store(snap)
+	pool := NewPool(1, &ptr, 5*time.Second, time.Second)
+
+	const events = 20
+	in := make(chan types.Event, events)
+	out := make(chan types.Result, events)
+	for i := 0; i < events; i++ {
+		in <- testEvent("post", map[string]any{"n": float64(i)})
+	}
+	close(in)
+	pool.Run(context.Background(), in, out)
+	for range out {
+	}
+
+	byID := map[string]*rules.Rule{}
+	for i := range snap.Rules {
+		byID[snap.Rules[i].RuleID] = &snap.Rules[i]
+	}
+	if got := byID["slowish"].Stats.Evals(); got != events {
+		t.Errorf("slowish evals = %d, want %d", got, events)
+	}
+	if got := byID["filtered"].Stats.Evals(); got != 0 {
+		t.Errorf("filtered evals = %d, want 0 (prefiltered rules never run)", got)
+	}
+	if byID["slowish"].Stats.EWMA() <= byID["fast"].Stats.EWMA() {
+		t.Errorf("slowish EWMA (%v) should exceed fast EWMA (%v)",
+			byID["slowish"].Stats.EWMA(), byID["fast"].Stats.EWMA())
+	}
+}

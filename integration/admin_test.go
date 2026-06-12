@@ -46,9 +46,13 @@ func buildAdminMux(snapshotPtr *atomic.Pointer[rules.Snapshot], reloader *rules.
 			return
 		}
 		type ruleInfo struct {
-			RuleID    string `json:"rule_id"`
-			EventType string `json:"event_type"`
-			Priority  int    `json:"priority"`
+			RuleID      string `json:"rule_id"`
+			EventType   string `json:"event_type"`
+			Priority    int    `json:"priority"`
+			Prefiltered int64  `json:"prefiltered"`
+			Evals       int64  `json:"evals"`
+			AvgUS       int64  `json:"avg_us"`
+			Slow        bool   `json:"slow"`
 		}
 		type response struct {
 			ID        string     `json:"id"`
@@ -56,12 +60,18 @@ func buildAdminMux(snapshotPtr *atomic.Pointer[rules.Snapshot], reloader *rules.
 			LoadedAt  time.Time  `json:"loaded_at"`
 			Rules     []ruleInfo `json:"rules"`
 		}
+		slowThreshold := rules.SlowRuleThreshold(snap.Rules)
 		ruleInfos := make([]ruleInfo, len(snap.Rules))
 		for i, rule := range snap.Rules {
+			ewma := rule.Stats.EWMA()
 			ruleInfos[i] = ruleInfo{
-				RuleID:    rule.RuleID,
-				EventType: rule.EventType,
-				Priority:  rule.Priority,
+				RuleID:      rule.RuleID,
+				EventType:   rule.EventType,
+				Priority:    rule.Priority,
+				Prefiltered: rule.Prefiltered.Load(),
+				Evals:       rule.Stats.Evals(),
+				AvgUS:       ewma.Microseconds(),
+				Slow:        slowThreshold > 0 && ewma > slowThreshold,
 			}
 		}
 		resp := response{
