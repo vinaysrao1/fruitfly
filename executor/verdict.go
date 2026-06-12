@@ -3,43 +3,25 @@ package executor
 import (
 	"fmt"
 
-	"github.com/vinaysrao1/fruitfly/rules"
 	"github.com/vinaysrao1/fruitfly/types"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 )
 
-// resolveVerdict implements priority-then-weight verdict resolution.
-func resolveVerdict(triggered []types.RuleResult, matchedRules []rules.Rule) types.Verdict {
+// resolveVerdict implements priority-then-weight verdict resolution: among
+// the highest-priority triggered rules, the heaviest verdict wins. One pass,
+// no allocation — results carry their rule's priority.
+func resolveVerdict(triggered []types.RuleResult) types.Verdict {
 	if len(triggered) == 0 {
 		return types.VerdictApprove
 	}
-
-	priorityOf := make(map[string]int, len(matchedRules))
-	for _, r := range matchedRules {
-		priorityOf[r.RuleID] = r.Priority
-	}
-
-	maxPriority := priorityOf[triggered[0].RuleID]
+	best, bestPriority := triggered[0].Verdict, triggered[0].Priority
 	for _, rr := range triggered[1:] {
-		if p := priorityOf[rr.RuleID]; p > maxPriority {
-			maxPriority = p
+		if rr.Priority > bestPriority ||
+			(rr.Priority == bestPriority && types.VerdictWeight(rr.Verdict) > types.VerdictWeight(best)) {
+			best, bestPriority = rr.Verdict, rr.Priority
 		}
 	}
-
-	best := types.VerdictApprove
-	bestWeight := 0
-	for _, rr := range triggered {
-		if priorityOf[rr.RuleID] != maxPriority {
-			continue
-		}
-		w := types.VerdictWeight(rr.Verdict)
-		if w > bestWeight {
-			bestWeight = w
-			best = rr.Verdict
-		}
-	}
-
 	return best
 }
 

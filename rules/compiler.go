@@ -1,6 +1,7 @@
 package rules
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,12 +16,22 @@ import (
 	"go.starlark.net/syntax"
 )
 
+// compileStepBudget bounds module-scope execution during compilation, the
+// same way rule evaluation is step-bounded at runtime.
+const compileStepBudget = 10_000_000
+
 // Rule is a compiled Starlark rule ready for execution.
 type Rule struct {
 	RuleID    string
 	EventType string // "*" matches all
 	Priority  int
 	Program   *starlark.Program
+	// Evaluate is the rule's evaluate() callable, initialized once at
+	// compile time with frozen globals. Frozen values are safe for
+	// concurrent calls, so every worker shares this one callable —
+	// stateful UDFs resolve their per-worker environment via thread
+	// locals (EnvLocal).
+	Evaluate starlark.Callable
 	// Match holds the lowered tier-1 prefilter clauses (nil = always run).
 	Match []Predicate
 	// Prefiltered counts events skipped by the prefilter; a pointer so all
@@ -103,9 +114,53 @@ func mergeByPriority(a, b []Rule) []Rule {
 	return append(out, b[j:]...)
 }
 
-// Compiler loads and compiles Starlark rules.
+// Compiler loads and compiles Starlark rules. It memoizes compiled rules by
+// file content hash, so reloading a 10k-rule directory after a one-file
+// edit costs one compile, not 10k. Cached rules share their Prefiltered
+// counters across snapshots, so prefilter stats survive reloads for
+// unchanged rules.
 type Compiler struct {
 	UDFs starlark.StringDict
+
+	mu    sync.Mutex
+	cache map[string]*Rule // content hash -> compiled rule
+}
+
+// cachedCompile returns the rule for src, compiling on cache miss.
+func (c *Compiler) cachedCompile(filename string, src []byte) (*Rule, string, error) {
+	sum := sha256.Sum256(src)
+	key := string(sum[:])
+
+	c.mu.Lock()
+	rule, ok := c.cache[key]
+	c.mu.Unlock()
+	if ok {
+		return rule, key, nil
+	}
+
+	rule, err := c.CompileSource(filename, string(src))
+	if err != nil {
+		return nil, "", err
+	}
+	c.mu.Lock()
+	if c.cache == nil {
+		c.cache = make(map[string]*Rule)
+	}
+	c.cache[key] = rule
+	c.mu.Unlock()
+	return rule, key, nil
+}
+
+// prune drops cache entries not used by the latest compile so renamed or
+// deleted rules don't accumulate.
+func (c *Compiler) prune(used map[string]bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key := range c.cache {
+		if !used[key] {
+			delete(c.cache, key)
+		}
+	}
 }
 
 // CompileDir reads all *.star files from dir, compiles them, and returns
@@ -121,8 +176,10 @@ func (c *Compiler) CompileDir(dir string) (*Snapshot, error) {
 	}
 
 	// Compile files in parallel (compilation is pure); report the first
-	// error in deterministic (sorted-glob) order.
+	// error in deterministic (sorted-glob) order. Unchanged files hit the
+	// content cache instead of recompiling.
 	compiled := make([]*Rule, len(files))
+	hashes := make([]string, len(files))
 	errs := make([]error, len(files))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, runtime.GOMAXPROCS(0))
@@ -137,7 +194,7 @@ func (c *Compiler) CompileDir(dir string) (*Snapshot, error) {
 				errs[i] = fmt.Errorf("read %s: %w", path, err)
 				return
 			}
-			compiled[i], errs[i] = c.CompileSource(filepath.Base(path), string(src))
+			compiled[i], hashes[i], errs[i] = c.cachedCompile(filepath.Base(path), src)
 		}(i, path)
 	}
 	wg.Wait()
@@ -149,13 +206,16 @@ func (c *Compiler) CompileDir(dir string) (*Snapshot, error) {
 
 	rules := make([]Rule, 0, len(files))
 	seen := make(map[string]string) // rule_id -> filename
+	used := make(map[string]bool, len(files))
 	for i, rule := range compiled {
 		if prev, dup := seen[rule.RuleID]; dup {
 			return nil, fmt.Errorf("duplicate rule_id %q in %s and %s", rule.RuleID, prev, filepath.Base(files[i]))
 		}
 		seen[rule.RuleID] = filepath.Base(files[i])
+		used[hashes[i]] = true
 		rules = append(rules, *rule)
 	}
+	c.prune(used)
 
 	// Sort by priority descending.
 	sort.Slice(rules, func(i, j int) bool {
@@ -194,12 +254,23 @@ func (c *Compiler) CompileSource(filename, source string) (*Rule, error) {
 		return nil, err
 	}
 
-	// Step 3: Execute the program to extract globals.
+	// Step 3: Execute the program once to extract globals, then freeze them
+	// so the resulting evaluate callable is safe to share across workers
+	// (and module-level state mutation is an error, not nondeterminism).
+	// Stateful UDFs (counter, memo, regex_match) resolve their environment
+	// from the evaluating thread, so no per-worker re-initialization is
+	// needed; calling them here, at module scope, fails by design.
+	//
+	// Module scope runs arbitrary code, so it gets the same step budget as
+	// rule evaluation: an unbounded Init would wedge the reloader (and
+	// startup) on a runaway module-scope loop until process restart.
 	thread := &starlark.Thread{Name: "compile:" + filename}
+	thread.SetMaxExecutionSteps(compileStepBudget)
 	globals, err := prog.Init(thread, c.UDFs)
 	if err != nil {
 		return nil, err
 	}
+	globals.Freeze()
 
 	// Step 4: Extract and validate metadata.
 	ruleID, err := stringGlobal(globals, filename, "rule_id")
@@ -219,7 +290,8 @@ func (c *Compiler) CompileSource(filename, source string) (*Rule, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s: missing required global 'evaluate'", filename)
 	}
-	if _, ok := evalVal.(starlark.Callable); !ok {
+	evalFn, ok := evalVal.(starlark.Callable)
+	if !ok {
 		return nil, fmt.Errorf("%s: 'evaluate' must be callable, got %s", filename, evalVal.Type())
 	}
 
@@ -237,6 +309,7 @@ func (c *Compiler) CompileSource(filename, source string) (*Rule, error) {
 		EventType:   eventType,
 		Priority:    priority,
 		Program:     prog,
+		Evaluate:    evalFn,
 		Match:       match,
 		Prefiltered: &atomic.Int64{},
 	}, nil

@@ -39,7 +39,7 @@ single, dependency-free binary that is trivial to run on one CPU.
 | Decode | ~2µs + 18KB (full `map[string]any`) | ~200ns | lazy raw-bytes view |
 | Rule match | ~50ns (indexed) | ~50ns | unchanged |
 | Tier-1 prefilter | — | ~10ns/rule | native predicates |
-| Tier-2 eval | ~2.5µs/rule × all matched | ~1.5µs/rule × few | thread reuse, no per-eval timers |
+| Tier-2 eval | ~2.5µs/rule × all matched | ~1.5µs/rule × few | thread reuse, no per-eval timers — **shipped: 0.75µs/rule, 8 allocs** |
 | Counters | ~450ns/call, 0 alloc | ~100ns | single-owner shards (no sync.Map) |
 | Result + output | ~µs + slices per event | ~100ns amortized | pooled results, interesting-only emission |
 
@@ -184,14 +184,16 @@ authors control the surviving set.
 
 - `CompileDir` compiles files across `GOMAXPROCS` goroutines (compilation is
   pure). 10k rules compile in roughly the time 10k/N took before.
-- Module globals are frozen after `Program.Init` (starlark-go freezes only
-  via `ExecFile`), deliberately tightening the contract: mutating
-  module-level state is a runtime error instead of silent per-worker
-  mutable globals (whose value would depend on which worker an event
-  happens to land on). *Future work:* pre-run `Init` once per rule at
-  compile time and share the frozen `evaluate` callables across workers,
-  eliminating the per-worker re-init warmup after a snapshot swap (now
-  rare, since unchanged content no longer republishes).
+- Rules are initialized **once at compile time**: `Program.Init` runs in
+  the compiler, globals are frozen (mutating module-level state is an
+  error, not per-worker nondeterminism), and the resulting `evaluate`
+  callable is shared by every worker. Stateful UDFs (`counter`, `memo`,
+  `regex_match`) resolve their per-worker environment through thread
+  locals, which is what makes the shared callable safe — and makes calling
+  them at module scope a compile error instead of a silent stub. Snapshot
+  swaps cost workers nothing (measured: identical to a normal event), and
+  the compiler memoizes by file content hash, so a one-file edit in a
+  large rulebook recompiles one file.
 - The reloader stops recompiling on a timer: poll ticks hash the rules
   directory contents and skip publication when nothing changed, so snapshot
   IDs change only when rules do. (Today every 10-second poll mints a new

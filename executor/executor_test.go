@@ -474,14 +474,15 @@ def evaluate(event):
 // a no-op placeholder so compilation succeeds), then at eval time pass a UDF dict where
 // "panic_now" is a builtin that triggers a real Go panic.
 func TestRulePanic_RecoveryViaPanickingUDF(t *testing.T) {
-	// Build compiler with a placeholder "panic_now" so the Starlark program compiles.
-	placeholderPanic := starlark.NewBuiltin("panic_now", func(
+	// Compile with an extra "panic_now" builtin that triggers a real Go
+	// panic. Compilation succeeds because evaluate() is not called during
+	// module initialization; evaluation then panics for real.
+	udfsWithPanic := rules.DefaultUDFs()
+	udfsWithPanic["panic_now"] = starlark.NewBuiltin("panic_now", func(
 		thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple,
 	) (starlark.Value, error) {
-		return starlark.None, nil // placeholder: never actually called during compile
+		panic("intentional Go panic from test UDF")
 	})
-	udfsWithPanic := rules.DefaultUDFs()
-	udfsWithPanic["panic_now"] = placeholderPanic
 
 	c := &rules.Compiler{UDFs: udfsWithPanic}
 	rule, err := c.CompileSource("panic.star", `
@@ -495,34 +496,12 @@ def evaluate(event):
 		t.Fatalf("CompileSource: %v", err)
 	}
 
-	snap := &rules.Snapshot{
-		ID:       "panic-snap",
-		Rules:    []rules.Rule{*rule},
-		LoadedAt: time.Now(),
-	}
-
 	var ptr atomic.Pointer[rules.Snapshot]
-	ptr.Store(snap)
 	pool := NewPool(1, &ptr, 5*time.Second, 1*time.Second)
-
-	// Build a worker and replace "panic_now" with a real Go-panicking builtin.
-	w := &worker{
-		id:         0,
-		pool:       pool,
-		memo:       make(map[string]any),
-		regexCache: make(map[string]*regexp.Regexp),
-		evalCache:  make(map[string]starlark.Callable),
-	}
-	w.udfs = buildUDFs(w)
-	// Replace placeholder with a builtin that triggers a real Go panic.
-	w.udfs["panic_now"] = starlark.NewBuiltin("panic_now", func(
-		thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple,
-	) (starlark.Value, error) {
-		panic("intentional Go panic from test UDF")
-	})
+	w := pool.newWorker(0)
 
 	starlarkEvt := eventToStarlark(testEvent("post", nil))
-	rr := w.evalRule(context.Background(), *rule, starlarkEvt, w.udfs)
+	rr := w.evalRule(context.Background(), rule, starlarkEvt)
 
 	// The Go panic must be caught by defer recover() in evalRule.
 	if rr.Err == nil {
@@ -1288,4 +1267,91 @@ def evaluate(event):
 	t.Logf("regexCache size with %d unique patterns: %d (grows unboundedly — no eviction)",
 		numUniquePatterns, len(w.regexCache))
 	t.Log("NOTE: regexCache has no eviction policy. With N unique patterns, it grows to size N unboundedly.")
+}
+
+// TestEventDeadline_SkipsRemainingRules: once the event's wall-clock budget
+// is spent, remaining rules fail without being evaluated.
+func TestEventDeadline_SkipsRemainingRules(t *testing.T) {
+	snap := compileRules(t, []struct{ filename, source string }{
+		{"slow.star", `
+rule_id = "slow"
+event_type = "post"
+priority = 200
+def evaluate(event):
+    x = 0
+    for i in range(100000000):
+        x += 1
+    return verdict("approve")
+`},
+		{"after.star", `
+rule_id = "after"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    return verdict("block")
+`},
+	})
+	var ptr atomic.Pointer[rules.Snapshot]
+	ptr.Store(snap)
+	// 50ms event budget: the slow rule burns it (or its step budget,
+	// whichever first); either way "after" must not produce a verdict
+	// under a dead deadline... unless the slow rule failed via steps with
+	// wall-clock budget left, in which case "after" legitimately runs.
+	pool := NewPool(1, &ptr, 50*time.Millisecond, time.Second)
+	result := runSingleEvent(t, pool, testEvent("post", nil))
+
+	if len(result.FailedRules) == 0 || result.FailedRules[0].RuleID != "slow" {
+		t.Fatalf("expected slow rule to fail, got %+v", result.FailedRules)
+	}
+	// If the event deadline expired, "after" must be in FailedRules with a
+	// deadline error and no Elapsed (it never ran).
+	for _, rr := range result.FailedRules[1:] {
+		if rr.RuleID == "after" {
+			if !strings.Contains(rr.ErrMsg, "deadline") {
+				t.Errorf("after: ErrMsg = %q, want deadline error", rr.ErrMsg)
+			}
+			if rr.Elapsed != 0 {
+				t.Errorf("after: Elapsed = %v, want 0 (never evaluated)", rr.Elapsed)
+			}
+		}
+	}
+}
+
+// TestSharedCallable_ConcurrentWorkers (review LOW-6): many workers call one
+// rule's shared frozen callable concurrently; counts must stay exact.
+func TestSharedCallable_ConcurrentWorkers(t *testing.T) {
+	snap := compileRule(t, `
+rule_id = "shared"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    counter("shared-entity", "post", 3600)
+    return verdict("approve")
+`)
+	var ptr atomic.Pointer[rules.Snapshot]
+	ptr.Store(snap)
+	pool := NewPool(8, &ptr, 5*time.Second, time.Second)
+
+	const events = 800
+	in := make(chan types.Event, events)
+	out := make(chan types.Result, events)
+	for i := 0; i < events; i++ {
+		in <- testEvent("post", nil)
+	}
+	close(in)
+	pool.Run(context.Background(), in, out)
+
+	failures := 0
+	for r := range out {
+		if len(r.FailedRules) > 0 {
+			failures++
+			t.Logf("failed: %s", r.FailedRules[0].ErrMsg)
+		}
+	}
+	if failures != 0 {
+		t.Errorf("%d/%d events failed under concurrent shared-callable evaluation", failures, events)
+	}
+	if got := pool.CounterSum("shared-entity", "post", 3600); got != events {
+		t.Errorf("CounterSum = %d, want %d (exact under concurrency)", got, events)
+	}
 }

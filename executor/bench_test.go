@@ -10,7 +10,6 @@ import (
 
 	"github.com/vinaysrao1/fruitfly/rules"
 	"github.com/vinaysrao1/fruitfly/types"
-	"go.starlark.net/starlark"
 )
 
 // setupCounterPool builds a pool and populates counters for `entities`
@@ -83,16 +82,8 @@ func BenchmarkProcessEvent_100Rules(b *testing.B) {
 	var ptr atomic.Pointer[rules.Snapshot]
 	ptr.Store(snap)
 	pool := NewPool(1, &ptr, 5*time.Second, time.Second)
-	pool.workers = make([]*worker, 1)
-	w := &worker{
-		id:         0,
-		pool:       pool,
-		memo:       make(map[string]any),
-		regexCache: nil,
-		evalCache:  make(map[string]starlark.Callable),
-	}
-	w.udfs = buildUDFs(w)
-	pool.workers[0] = w
+	pool.workers = []*worker{pool.newWorker(0)}
+	w := pool.workers[0]
 
 	event := types.Event{
 		EventID:   "bench-event",
@@ -120,23 +111,41 @@ func BenchmarkEvalRuleOnly(b *testing.B) {
 	var ptr atomic.Pointer[rules.Snapshot]
 	ptr.Store(snap)
 	pool := NewPool(1, &ptr, 5*time.Second, time.Second)
-	w := &worker{
-		id:        0,
-		pool:      pool,
-		memo:      make(map[string]any),
-		evalCache: make(map[string]starlark.Callable),
-	}
-	w.udfs = buildUDFs(w)
+	w := pool.newWorker(0)
 
-	rule := snap.Rules[0]
+	rule := &snap.Rules[0]
 	evt := eventToStarlark(types.Event{EventID: "e", EventType: "type-0", Timestamp: time.Now()})
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rr := w.evalRule(ctx, rule, evt, w.udfs)
+		rr := w.evalRule(ctx, rule, evt)
 		if rr.Err != nil {
 			b.Fatal(rr.Err)
 		}
+	}
+}
+
+// BenchmarkSnapshotSwap measures the per-worker cost of switching to a new
+// snapshot mid-stream: with compile-time shared callables it should be the
+// cost of one ordinary evaluation (no re-initialization).
+func BenchmarkSnapshotSwap(b *testing.B) {
+	snapA := benchSnapshot(b, 100)
+	snapB := benchSnapshot(b, 100)
+	var ptr atomic.Pointer[rules.Snapshot]
+	pool := NewPool(1, &ptr, 5*time.Second, time.Second)
+	pool.workers = []*worker{pool.newWorker(0)}
+	w := pool.workers[0]
+
+	event := types.Event{EventID: "e", EventType: "type-5", Timestamp: time.Now()}
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i%2 == 0 {
+			ptr.Store(snapA)
+		} else {
+			ptr.Store(snapB)
+		}
+		w.processEvent(ctx, event)
 	}
 }
 

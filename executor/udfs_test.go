@@ -317,10 +317,12 @@ def evaluate(event):
 	}
 }
 
-// --- T41: DefaultUDFs stub counter at compile time ---
+// --- T41: stateful UDFs at module scope are compile errors ---
 
-// T41: Rule calling counter() at module scope gets None from stubBuiltin. No compile error.
-func TestDefaultUDFs_StubCounterAtCompileTime(t *testing.T) {
+// T41: counter() at module scope has no evaluation environment; it must be
+// a compile error rather than a silently-baked stub value (the previous
+// behavior baked None into the rule with no signal).
+func TestModuleScopeCounter_IsCompileError(t *testing.T) {
 	c := &rules.Compiler{UDFs: rules.DefaultUDFs()}
 	_, err := c.CompileSource("stub_counter_test.star", `
 rule_id = "stub-counter"
@@ -330,15 +332,17 @@ x = counter("entity", "type", 60)
 def evaluate(event):
     return verdict("approve")
 `)
-	if err != nil {
-		t.Fatalf("expected compilation to succeed with stub counter, got: %v", err)
+	if err == nil {
+		t.Fatal("expected compile error for module-scope counter(), got nil")
+	}
+	if !strings.Contains(err.Error(), "no evaluation context") {
+		t.Errorf("error = %v, want 'no evaluation context'", err)
 	}
 }
 
-// --- T42: DefaultUDFs stub memo at compile time ---
+// --- T42: memo() at module scope is a compile error ---
 
-// T42: Rule calling memo() at module scope gets None from stubBuiltin. No compile error.
-func TestDefaultUDFs_StubMemoAtCompileTime(t *testing.T) {
+func TestModuleScopeMemo_IsCompileError(t *testing.T) {
 	c := &rules.Compiler{UDFs: rules.DefaultUDFs()}
 	_, err := c.CompileSource("stub_memo_test.star", `
 rule_id = "stub-memo"
@@ -348,7 +352,10 @@ x = memo("k", lambda: 42)
 def evaluate(event):
     return verdict("approve")
 `)
-	if err != nil {
-		t.Fatalf("expected compilation to succeed with stub memo, got: %v", err)
+	if err == nil {
+		t.Fatal("expected compile error for module-scope memo(), got nil")
+	}
+	if !strings.Contains(err.Error(), "no evaluation context") {
+		t.Errorf("error = %v, want 'no evaluation context'", err)
 	}
 }
