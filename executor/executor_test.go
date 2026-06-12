@@ -474,14 +474,15 @@ def evaluate(event):
 // a no-op placeholder so compilation succeeds), then at eval time pass a UDF dict where
 // "panic_now" is a builtin that triggers a real Go panic.
 func TestRulePanic_RecoveryViaPanickingUDF(t *testing.T) {
-	// Build compiler with a placeholder "panic_now" so the Starlark program compiles.
-	placeholderPanic := starlark.NewBuiltin("panic_now", func(
+	// Compile with an extra "panic_now" builtin that triggers a real Go
+	// panic. Compilation succeeds because evaluate() is not called during
+	// module initialization; evaluation then panics for real.
+	udfsWithPanic := rules.DefaultUDFs()
+	udfsWithPanic["panic_now"] = starlark.NewBuiltin("panic_now", func(
 		thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple,
 	) (starlark.Value, error) {
-		return starlark.None, nil // placeholder: never actually called during compile
+		panic("intentional Go panic from test UDF")
 	})
-	udfsWithPanic := rules.DefaultUDFs()
-	udfsWithPanic["panic_now"] = placeholderPanic
 
 	c := &rules.Compiler{UDFs: udfsWithPanic}
 	rule, err := c.CompileSource("panic.star", `
@@ -495,34 +496,12 @@ def evaluate(event):
 		t.Fatalf("CompileSource: %v", err)
 	}
 
-	snap := &rules.Snapshot{
-		ID:       "panic-snap",
-		Rules:    []rules.Rule{*rule},
-		LoadedAt: time.Now(),
-	}
-
 	var ptr atomic.Pointer[rules.Snapshot]
-	ptr.Store(snap)
 	pool := NewPool(1, &ptr, 5*time.Second, 1*time.Second)
-
-	// Build a worker and replace "panic_now" with a real Go-panicking builtin.
-	w := &worker{
-		id:         0,
-		pool:       pool,
-		memo:       make(map[string]any),
-		regexCache: make(map[string]*regexp.Regexp),
-		evalCache:  make(map[string]starlark.Callable),
-	}
-	w.udfs = buildUDFs(w)
-	// Replace placeholder with a builtin that triggers a real Go panic.
-	w.udfs["panic_now"] = starlark.NewBuiltin("panic_now", func(
-		thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple,
-	) (starlark.Value, error) {
-		panic("intentional Go panic from test UDF")
-	})
+	w := pool.newWorker(0)
 
 	starlarkEvt := eventToStarlark(testEvent("post", nil))
-	rr := w.evalRule(context.Background(), *rule, starlarkEvt, w.udfs)
+	rr := w.evalRule(context.Background(), rule, starlarkEvt)
 
 	// The Go panic must be caught by defer recover() in evalRule.
 	if rr.Err == nil {

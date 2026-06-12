@@ -2,6 +2,7 @@ package rules
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -419,5 +420,109 @@ func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCompileDir_ContentCacheReusesUnchangedRules: recompiling after a
+// one-file edit reuses the compiled rule (same shared Prefiltered counter)
+// for unchanged files and recompiles only the changed one.
+func TestCompileDir_ContentCacheReusesUnchangedRules(t *testing.T) {
+	c := newTestCompiler()
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a.star"), `
+rule_id = "rule-a"
+event_type = "post"
+priority = 100
+def evaluate(event):
+    return verdict("approve")
+`)
+	writeFile(t, filepath.Join(dir, "b.star"), `
+rule_id = "rule-b"
+event_type = "post"
+priority = 50
+def evaluate(event):
+    return verdict("approve")
+`)
+
+	snap1, err := c.CompileDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counters1 := map[string]*atomic.Int64{}
+	for i := range snap1.Rules {
+		counters1[snap1.Rules[i].RuleID] = snap1.Rules[i].Prefiltered
+	}
+
+	// Edit only b.star.
+	writeFile(t, filepath.Join(dir, "b.star"), `
+rule_id = "rule-b"
+event_type = "post"
+priority = 60
+def evaluate(event):
+    return verdict("approve")
+`)
+	snap2, err := c.CompileDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range snap2.Rules {
+		r := &snap2.Rules[i]
+		switch r.RuleID {
+		case "rule-a":
+			if r.Prefiltered != counters1["rule-a"] {
+				t.Error("unchanged rule-a was recompiled (Prefiltered counter not shared)")
+			}
+		case "rule-b":
+			if r.Prefiltered == counters1["rule-b"] {
+				t.Error("changed rule-b was not recompiled")
+			}
+			if r.Priority != 60 {
+				t.Errorf("rule-b priority = %d, want 60", r.Priority)
+			}
+		}
+	}
+}
+
+// BenchmarkCompileDir500 measures cold compilation of 500 rules.
+func BenchmarkCompileDir500(b *testing.B) {
+	dir := b.TempDir()
+	for i := 0; i < 500; i++ {
+		src := fmt.Sprintf("rule_id = \"r-%d\"\nevent_type = \"t-%d\"\npriority = %d\ndef evaluate(event):\n    return verdict(\"approve\")\n", i, i%10, i)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("r%03d.star", i)), []byte(src), 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c := newTestCompiler() // fresh compiler: cold cache
+		if _, err := c.CompileDir(dir); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkRecompileOneChanged500 measures a warm reload after one file
+// changes out of 500 — the content cache should make this delta-cost.
+func BenchmarkRecompileOneChanged500(b *testing.B) {
+	dir := b.TempDir()
+	for i := 0; i < 500; i++ {
+		src := fmt.Sprintf("rule_id = \"r-%d\"\nevent_type = \"t-%d\"\npriority = %d\ndef evaluate(event):\n    return verdict(\"approve\")\n", i, i%10, i)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("r%03d.star", i)), []byte(src), 0o644); err != nil {
+			b.Fatal(err)
+		}
+	}
+	c := newTestCompiler()
+	if _, err := c.CompileDir(dir); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		src := fmt.Sprintf("rule_id = \"r-0\"\nevent_type = \"t-0\"\npriority = %d\ndef evaluate(event):\n    return verdict(\"approve\")\n", 1000+i)
+		if err := os.WriteFile(filepath.Join(dir, "r000.star"), []byte(src), 0o644); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := c.CompileDir(dir); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

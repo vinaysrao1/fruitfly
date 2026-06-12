@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,12 +18,16 @@ import (
 type worker struct {
 	id         int
 	pool       *Pool
-	memo       map[string]any
+	memo       map[string]starlark.Value
 	regexCache map[string]*regexp.Regexp
-	evalCache  map[string]starlark.Callable // ruleID -> cached evaluate fn
-	evalSnap   string                       // snapshot ID that populated the cache
-	udfs       starlark.StringDict          // worker-lifetime UDFs (built once)
-	curEntity  string                       // routing key of the event being processed
+	// thread is reused for every evaluation on this worker: rules ship with
+	// pre-initialized shared callables, and stateful UDFs resolve this
+	// worker through the thread's EnvLocal, so no per-eval thread or
+	// predeclared dict is needed.
+	thread    *starlark.Thread
+	args      starlark.Tuple // reusable 1-slot args for evaluate(event)
+	curEntity string         // routing key of the event being processed
+	curRule   string         // rule being evaluated (for print logging)
 }
 
 // Pool manages worker goroutines that evaluate rules against events.
@@ -30,7 +35,7 @@ type Pool struct {
 	workerCount  int
 	snapshot     *atomic.Pointer[rules.Snapshot]
 	eventTimeout time.Duration
-	ruleTimeout  time.Duration
+	ruleTimeout  time.Duration // retained for API compatibility; per-rule bounding is step-based
 	counters     counterStore
 	// counterAffinity, when set (cluster mode), restricts counter() keys to
 	// the event's routing entity: any other key would scatter increments
@@ -57,20 +62,30 @@ func NewPool(
 	}
 }
 
+// newWorker builds a worker with its reusable evaluation thread.
+func (p *Pool) newWorker(id int) *worker {
+	w := &worker{
+		id:         id,
+		pool:       p,
+		memo:       make(map[string]starlark.Value),
+		regexCache: make(map[string]*regexp.Regexp),
+		args:       make(starlark.Tuple, 1),
+	}
+	w.thread = &starlark.Thread{
+		Print: func(_ *starlark.Thread, msg string) {
+			slog.Info("rule log", "rule_id", w.curRule, "message", msg)
+		},
+	}
+	w.thread.SetLocal(rules.EnvLocal, w)
+	return w
+}
+
 // Run starts N worker goroutines. Blocks until in is closed and all events processed.
 // Closes out before returning.
 func (p *Pool) Run(ctx context.Context, in <-chan types.Event, out chan<- types.Result) {
 	p.workers = make([]*worker, p.workerCount)
 	for i := range p.workers {
-		w := &worker{
-			id:         i,
-			pool:       p,
-			memo:       make(map[string]any),
-			regexCache: make(map[string]*regexp.Regexp),
-			evalCache:  make(map[string]starlark.Callable),
-		}
-		w.udfs = buildUDFs(w)
-		p.workers[i] = w
+		p.workers[i] = p.newWorker(i)
 	}
 
 	var wg sync.WaitGroup
@@ -123,9 +138,14 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 
 	start := time.Now()
 
-	// Apply event-level timeout so total rule evaluation time is bounded.
+	// Event-level wall-clock bound: one timeout and one cancellation hook
+	// per event (per-rule bounding is step-based inside evalRule).
 	eventCtx, cancel := context.WithTimeout(ctx, w.pool.eventTimeout)
 	defer cancel()
+	stop := context.AfterFunc(eventCtx, func() {
+		w.thread.Cancel(eventCtx.Err().Error())
+	})
+	defer stop()
 
 	snap := w.pool.snapshot.Load()
 	if snap == nil {
@@ -139,12 +159,6 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 			Payload:      event.Payload,
 			RawPayload:   event.RawJSON,
 		}
-	}
-
-	// Invalidate eval cache when snapshot changes.
-	if snap.ID != w.evalSnap {
-		clear(w.evalCache)
-		w.evalSnap = snap.ID
 	}
 
 	matchedRules := snap.RulesForEvent(event.EventType)
@@ -163,7 +177,16 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 			rule.Prefiltered.Add(1)
 			continue
 		}
-		rr := w.evalRule(eventCtx, *rule, starlarkEvent, w.udfs)
+		// The event's wall-clock budget is exhausted: remaining rules fail
+		// without running rather than evaluating under a dead deadline.
+		if ctxErr := eventCtx.Err(); ctxErr != nil {
+			rr := types.RuleResult{RuleID: rule.RuleID, Priority: rule.Priority}
+			rr.Err = fmt.Errorf("rule %s: %w", rule.RuleID, ctxErr)
+			rr.ErrMsg = rr.Err.Error()
+			failed = append(failed, rr)
+			continue
+		}
+		rr := w.evalRule(eventCtx, rule, starlarkEvent)
 		if rr.Err != nil {
 			failed = append(failed, rr)
 		} else if rr.Verdict != "" {
@@ -174,7 +197,7 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 	return types.Result{
 		EventID:        event.EventID,
 		EventType:      event.EventType,
-		FinalVerdict:   resolveVerdict(triggered, matchedRules),
+		FinalVerdict:   resolveVerdict(triggered),
 		TriggeredRules: triggered,
 		FailedRules:    failed,
 		Payload:        event.Payload,
@@ -184,8 +207,9 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 	}
 }
 
-func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent starlark.Value, predeclared starlark.StringDict) (rr types.RuleResult) {
+func (w *worker) evalRule(ctx context.Context, rule *rules.Rule, starlarkEvent starlark.Value) (rr types.RuleResult) {
 	rr.RuleID = rule.RuleID
+	rr.Priority = rule.Priority
 	start := time.Now()
 
 	defer func() {
@@ -198,59 +222,26 @@ func (w *worker) evalRule(ctx context.Context, rule rules.Rule, starlarkEvent st
 		}
 	}()
 
-	ruleCtx, cancel := context.WithTimeout(ctx, w.pool.ruleTimeout)
-	defer cancel()
+	// Reuse the worker's thread: clear any prior cancellation, grant this
+	// rule a fresh step budget on top of the accumulated count, and point
+	// the print hook at this rule.
+	w.curRule = rule.RuleID
+	w.thread.Name = rule.RuleID
+	w.thread.Uncancel()
+	w.thread.SetMaxExecutionSteps(w.thread.ExecutionSteps() + ruleStepBudget)
 
-	thread := &starlark.Thread{
-		Name: fmt.Sprintf("worker-%d/rule-%s", w.id, rule.RuleID),
-		Print: func(_ *starlark.Thread, msg string) {
-			slog.Info("rule log", "rule_id", rule.RuleID, "message", msg)
-		},
-	}
-
-	// Cancel Starlark thread when context expires. context.AfterFunc avoids
-	// spawning a watcher goroutine per rule evaluation.
-	stop := context.AfterFunc(ruleCtx, func() {
-		thread.Cancel(ruleCtx.Err().Error())
-	})
-	defer stop()
-
-	evalFn, cached := w.evalCache[rule.RuleID]
-	if !cached {
-		globals, err := rule.Program.Init(thread, predeclared)
-		if err != nil {
-			if ctxErr := ruleCtx.Err(); ctxErr != nil {
-				rr.Err = fmt.Errorf("rule %s init: %w: %v", rule.RuleID, ctxErr, err)
-			} else {
-				rr.Err = fmt.Errorf("rule %s init: %w", rule.RuleID, err)
-			}
-			return
-		}
-		// Freeze module globals: mutating module-level state is an error,
-		// not nondeterministic per-worker state.
-		globals.Freeze()
-
-		fn, ok := globals["evaluate"]
-		if !ok {
-			rr.Err = fmt.Errorf("rule %s: missing evaluate after init", rule.RuleID)
-			return
-		}
-		callable, ok := fn.(starlark.Callable)
-		if !ok {
-			rr.Err = fmt.Errorf("rule %s: evaluate is not callable", rule.RuleID)
-			return
-		}
-		w.evalCache[rule.RuleID] = callable
-		evalFn = callable
-	}
-
-	retVal, err := starlark.Call(thread, evalFn, starlark.Tuple{starlarkEvent}, nil)
+	w.args[0] = starlarkEvent
+	retVal, err := starlark.Call(w.thread, rule.Evaluate, w.args, nil)
 	if err != nil {
-		if ctxErr := ruleCtx.Err(); ctxErr != nil {
+		switch {
+		case ctx.Err() != nil:
 			// Keep the real cause (cancellation vs deadline) and the
 			// underlying eval error rather than relabelling both.
-			rr.Err = fmt.Errorf("rule %s: %w: %v", rule.RuleID, ctxErr, err)
-		} else {
+			rr.Err = fmt.Errorf("rule %s: %w: %v", rule.RuleID, ctx.Err(), err)
+		case strings.Contains(err.Error(), "too many steps"):
+			// Step budget exceeded — the per-rule analogue of a deadline.
+			rr.Err = fmt.Errorf("rule %s: step budget exceeded: %w: %v", rule.RuleID, context.DeadlineExceeded, err)
+		default:
 			rr.Err = fmt.Errorf("rule %s: %w", rule.RuleID, err)
 		}
 		return

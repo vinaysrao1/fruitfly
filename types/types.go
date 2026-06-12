@@ -42,9 +42,10 @@ func VerdictWeight(v Verdict) int {
 
 // RuleResult captures the outcome of a single rule evaluation.
 type RuleResult struct {
-	RuleID  string
-	Verdict Verdict
-	Reason  string
+	RuleID   string
+	Priority int
+	Verdict  Verdict
+	Reason   string
 	// Err is the in-process error; bare errors marshal as "{}", so ErrMsg
 	// carries the message for DuckDB rows and webhook bodies.
 	Err     error `json:"-"`

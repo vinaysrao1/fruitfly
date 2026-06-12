@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vinaysrao1/fruitfly/rules"
 	"github.com/vinaysrao1/fruitfly/types"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
@@ -16,15 +15,11 @@ import (
 // Already covered by TestPriorityResolution in executor_test.go.
 // This test exercises resolveVerdict directly for clarity.
 func TestResolveVerdict_HighestPriorityWins(t *testing.T) {
-	matchedRules := []rules.Rule{
-		{RuleID: "high", EventType: "post", Priority: 100},
-		{RuleID: "low", EventType: "post", Priority: 50},
-	}
 	triggered := []types.RuleResult{
-		{RuleID: "high", Verdict: types.VerdictApprove},
-		{RuleID: "low", Verdict: types.VerdictBlock},
+		{RuleID: "high", Priority: 100, Verdict: types.VerdictApprove},
+		{RuleID: "low", Priority: 50, Verdict: types.VerdictBlock},
 	}
-	got := resolveVerdict(triggered, matchedRules)
+	got := resolveVerdict(triggered)
 	if got != types.VerdictApprove {
 		t.Errorf("resolveVerdict = %q, want approve (highest priority wins)", got)
 	}
@@ -34,15 +29,11 @@ func TestResolveVerdict_HighestPriorityWins(t *testing.T) {
 // Already covered by TestSamePriority_TieBreaking in executor_test.go.
 // Direct unit test for documentation.
 func TestResolveVerdict_SamePriorityWeightTiebreak(t *testing.T) {
-	matchedRules := []rules.Rule{
-		{RuleID: "r-approve", EventType: "post", Priority: 100},
-		{RuleID: "r-block", EventType: "post", Priority: 100},
-	}
 	triggered := []types.RuleResult{
-		{RuleID: "r-approve", Verdict: types.VerdictApprove},
-		{RuleID: "r-block", Verdict: types.VerdictBlock},
+		{RuleID: "r-approve", Priority: 100, Verdict: types.VerdictApprove},
+		{RuleID: "r-block", Priority: 100, Verdict: types.VerdictBlock},
 	}
-	got := resolveVerdict(triggered, matchedRules)
+	got := resolveVerdict(triggered)
 	if got != types.VerdictBlock {
 		t.Errorf("resolveVerdict = %q, want block (block weight > approve weight at same priority)", got)
 	}
@@ -50,7 +41,7 @@ func TestResolveVerdict_SamePriorityWeightTiebreak(t *testing.T) {
 
 // T35: No triggered rules -> default approve.
 func TestResolveVerdict_NoTriggeredRules_DefaultApprove(t *testing.T) {
-	got := resolveVerdict(nil, []rules.Rule{{RuleID: "r", EventType: "post", Priority: 100}})
+	got := resolveVerdict(nil)
 	if got != types.VerdictApprove {
 		t.Errorf("resolveVerdict = %q, want approve (no triggered rules)", got)
 	}
@@ -59,11 +50,7 @@ func TestResolveVerdict_NoTriggeredRules_DefaultApprove(t *testing.T) {
 // T36: All rules fail -> default approve (triggered is empty).
 func TestResolveVerdict_AllRulesFail_DefaultApprove(t *testing.T) {
 	// triggered is empty because failed rules don't go into triggered
-	matchedRules := []rules.Rule{
-		{RuleID: "fail-1", EventType: "post", Priority: 100},
-		{RuleID: "fail-2", EventType: "post", Priority: 50},
-	}
-	got := resolveVerdict([]types.RuleResult{}, matchedRules)
+	got := resolveVerdict([]types.RuleResult{})
 	if got != types.VerdictApprove {
 		t.Errorf("resolveVerdict = %q, want approve (all rules failed)", got)
 	}
