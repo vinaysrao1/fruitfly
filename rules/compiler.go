@@ -16,6 +16,10 @@ import (
 	"go.starlark.net/syntax"
 )
 
+// compileStepBudget bounds module-scope execution during compilation, the
+// same way rule evaluation is step-bounded at runtime.
+const compileStepBudget = 10_000_000
+
 // Rule is a compiled Starlark rule ready for execution.
 type Rule struct {
 	RuleID    string
@@ -256,7 +260,12 @@ func (c *Compiler) CompileSource(filename, source string) (*Rule, error) {
 	// Stateful UDFs (counter, memo, regex_match) resolve their environment
 	// from the evaluating thread, so no per-worker re-initialization is
 	// needed; calling them here, at module scope, fails by design.
+	//
+	// Module scope runs arbitrary code, so it gets the same step budget as
+	// rule evaluation: an unbounded Init would wedge the reloader (and
+	// startup) on a runaway module-scope loop until process restart.
 	thread := &starlark.Thread{Name: "compile:" + filename}
+	thread.SetMaxExecutionSteps(compileStepBudget)
 	globals, err := prog.Init(thread, c.UDFs)
 	if err != nil {
 		return nil, err

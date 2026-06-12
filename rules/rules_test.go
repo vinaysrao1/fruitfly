@@ -526,3 +526,25 @@ func BenchmarkRecompileOneChanged500(b *testing.B) {
 		}
 	}
 }
+
+// TestCompile_ModuleScopeStepBudget (review HIGH-1): a runaway module-scope
+// loop must be a clean compile error, not an unbounded Init that wedges the
+// reloader until process restart.
+func TestCompile_ModuleScopeStepBudget(t *testing.T) {
+	c := newTestCompiler()
+	_, err := c.CompileSource("runaway.star", `
+rule_id = "runaway"
+event_type = "post"
+priority = 1
+x = 0
+y = [None for i in range(1000000000) for j in range(100)]
+def evaluate(event):
+    return verdict("approve")
+`)
+	if err == nil {
+		t.Fatal("expected step-budget compile error for runaway module scope, got nil")
+	}
+	if !strings.Contains(err.Error(), "too many steps") {
+		t.Errorf("error = %v, want 'too many steps'", err)
+	}
+}

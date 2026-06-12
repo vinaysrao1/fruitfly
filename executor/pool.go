@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +27,9 @@ type worker struct {
 	args      starlark.Tuple // reusable 1-slot args for evaluate(event)
 	curEntity string         // routing key of the event being processed
 	curRule   string         // rule being evaluated (for print logging)
+	// stepsExceeded is set by the thread's OnMaxSteps hook so step-budget
+	// exhaustion is classified by flag, not by error-string matching.
+	stepsExceeded bool
 }
 
 // Pool manages worker goroutines that evaluate rules against events.
@@ -74,6 +76,12 @@ func (p *Pool) newWorker(id int) *worker {
 	w.thread = &starlark.Thread{
 		Print: func(_ *starlark.Thread, msg string) {
 			slog.Info("rule log", "rule_id", w.curRule, "message", msg)
+		},
+		// Flag step-budget exhaustion so evalRule can classify it without
+		// matching on the interpreter's error text.
+		OnMaxSteps: func(th *starlark.Thread) {
+			w.stepsExceeded = true
+			th.Cancel("too many steps")
 		},
 	}
 	w.thread.SetLocal(rules.EnvLocal, w)
@@ -142,10 +150,19 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 	// per event (per-rule bounding is step-based inside evalRule).
 	eventCtx, cancel := context.WithTimeout(ctx, w.pool.eventTimeout)
 	defer cancel()
+	// If the deadline callback has already started when stop() is called,
+	// stop() returns false without waiting — wait it out so a stale Cancel
+	// can never land on the reused thread during a later event.
+	cancelDone := make(chan struct{})
 	stop := context.AfterFunc(eventCtx, func() {
+		defer close(cancelDone)
 		w.thread.Cancel(eventCtx.Err().Error())
 	})
-	defer stop()
+	defer func() {
+		if !stop() {
+			<-cancelDone
+		}
+	}()
 
 	snap := w.pool.snapshot.Load()
 	if snap == nil {
@@ -228,6 +245,7 @@ func (w *worker) evalRule(ctx context.Context, rule *rules.Rule, starlarkEvent s
 	w.curRule = rule.RuleID
 	w.thread.Name = rule.RuleID
 	w.thread.Uncancel()
+	w.stepsExceeded = false
 	w.thread.SetMaxExecutionSteps(w.thread.ExecutionSteps() + ruleStepBudget)
 
 	w.args[0] = starlarkEvent
@@ -238,7 +256,7 @@ func (w *worker) evalRule(ctx context.Context, rule *rules.Rule, starlarkEvent s
 			// Keep the real cause (cancellation vs deadline) and the
 			// underlying eval error rather than relabelling both.
 			rr.Err = fmt.Errorf("rule %s: %w: %v", rule.RuleID, ctx.Err(), err)
-		case strings.Contains(err.Error(), "too many steps"):
+		case w.stepsExceeded:
 			// Step budget exceeded — the per-rule analogue of a deadline.
 			rr.Err = fmt.Errorf("rule %s: step budget exceeded: %w: %v", rule.RuleID, context.DeadlineExceeded, err)
 		default:
