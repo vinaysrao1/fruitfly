@@ -140,6 +140,9 @@ func main() {
 			EventType   string `json:"event_type"`
 			Priority    int    `json:"priority"`
 			Prefiltered int64  `json:"prefiltered"`
+			Evals       int64  `json:"evals"`
+			AvgUS       int64  `json:"avg_us"`
+			Slow        bool   `json:"slow"`
 		}
 		type response struct {
 			ID        string     `json:"id"`
@@ -147,13 +150,18 @@ func main() {
 			LoadedAt  time.Time  `json:"loaded_at"`
 			Rules     []ruleInfo `json:"rules"`
 		}
+		slowThreshold := rules.SlowRuleThreshold(snap.Rules)
 		ruleInfos := make([]ruleInfo, len(snap.Rules))
 		for i, r := range snap.Rules {
+			ewma := r.Stats.EWMA()
 			ruleInfos[i] = ruleInfo{
 				RuleID:      r.RuleID,
 				EventType:   r.EventType,
 				Priority:    r.Priority,
 				Prefiltered: r.Prefiltered.Load(),
+				Evals:       r.Stats.Evals(),
+				AvgUS:       ewma.Microseconds(),
+				Slow:        slowThreshold > 0 && ewma > slowThreshold,
 			}
 		}
 		resp := response{

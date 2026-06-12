@@ -204,6 +204,8 @@ func (w *worker) processEvent(ctx context.Context, event types.Event) types.Resu
 			continue
 		}
 		rr := w.evalRule(eventCtx, rule, starlarkEvent)
+		rule.Stats.Observe(rr.Elapsed)
+		rule.Stats.WarnIfSlow(rule.RuleID, w.pool.eventTimeout, len(matchedRules))
 		if rr.Err != nil {
 			failed = append(failed, rr)
 		} else if rr.Verdict != "" {

@@ -38,6 +38,9 @@ type Rule struct {
 	// copies of this Rule share one counter, surfaced via /admin/rules so
 	// an over-aggressive match block is visible rather than silent.
 	Prefiltered *atomic.Int64
+	// Stats tracks evaluation timing (EWMA) for slow-rule detection;
+	// shared by all copies of this Rule, like Prefiltered.
+	Stats *RuleStats
 }
 
 // Snapshot is an immutable collection of compiled rules, sorted by priority desc.
@@ -312,6 +315,7 @@ func (c *Compiler) CompileSource(filename, source string) (*Rule, error) {
 		Evaluate:    evalFn,
 		Match:       match,
 		Prefiltered: &atomic.Int64{},
+		Stats:       &RuleStats{},
 	}, nil
 }
 
