@@ -250,6 +250,17 @@ func (w *worker) evalRule(ctx context.Context, rule *rules.Rule, starlarkEvent s
 	w.stepsExceeded = false
 	w.thread.SetMaxExecutionSteps(w.thread.ExecutionSteps() + ruleStepBudget)
 
+	// Re-check the event context AFTER Uncancel: the event-deadline
+	// AfterFunc may have fired (and cancelled the thread) between the
+	// caller's ctx check and the Uncancel above, which would erase that
+	// cancellation and let the rule run its full step budget under a dead
+	// context. A dead ctx here fails the rule exactly like the caller's
+	// pre-check.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		rr.Err = fmt.Errorf("rule %s: %w", rule.RuleID, ctxErr)
+		return
+	}
+
 	w.args[0] = starlarkEvent
 	retVal, err := starlark.Call(w.thread, rule.Evaluate, w.args, nil)
 	if err != nil {
